@@ -7,7 +7,6 @@ import {
   ListResourcesRequestSchema, ReadResourceRequestSchema,
   ListPromptsRequestSchema, GetPromptRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { spawn } from "child_process";
 import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
@@ -19,28 +18,11 @@ const __dirname = path.dirname(__filename);
 
 const LOG_DIR = path.join(os.homedir(), 'Projects', 'actual-report', 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'actual-commands.log');
-const LOCK_DIR = path.join(LOG_DIR, '.actual.lock');
-const LOCK_STALE_SECONDS = 3600;
 const ACTUAL_RC_PATH = path.join(os.homedir(), '.actualrc.json');
 
-const RETRYABLE_ERRORS = /SQLITE_BUSY|database is locked|SQLITE_IOERR|getSyncError/i;
-
-// Ensure PATH includes the node version used in the wrapper
-const extendedEnv = { ...process.env };
-extendedEnv.PATH = `/usr/local/bin:${process.env.PATH || ''}`;
-
-const server = new Server({
-  name: "actual-cli-mcp",
-  version: "1.1.0"
-}, {
-  capabilities: {
-    tools: {},
-    resources: {},
-    prompts: {}
-  }
-});
-
-// Helper: Logging
+// ───────────────────────────────────────────────────────────
+// Logging
+// ───────────────────────────────────────────────────────────
 async function logMessage(msg) {
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
   const line = `${timestamp} - ${msg}\n`;
@@ -54,69 +36,14 @@ async function logMessage(msg) {
   }
 }
 
-// Helper: Locking
-async function acquireLock() {
-  if (process.env._ACTUAL_NOLOCK === '1') return true;
-  
-  while (true) {
-    try {
-      if (!fsSync.existsSync(LOG_DIR)) {
-        await fs.mkdir(LOG_DIR, { recursive: true });
-      }
-      await fs.mkdir(LOCK_DIR);
-      // Success, lock acquired
-      const info = `${process.pid}:${Math.floor(Date.now() / 1000)}`;
-      await fs.writeFile(path.join(LOCK_DIR, 'info'), info);
-      return true;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      
-      // Lock exists, inspect it
-      try {
-        const infoStr = await fs.readFile(path.join(LOCK_DIR, 'info'), 'utf8');
-        const [lockPid, lockTime] = infoStr.split(':');
-        const age = Math.floor(Date.now() / 1000) - parseInt(lockTime, 10);
-        
-        if (age >= LOCK_STALE_SECONDS) {
-          await logMessage(`Removing stale lock (PID ${lockPid}, age ${age}s)`);
-          await fs.rm(LOCK_DIR, { recursive: true, force: true });
-          continue;
-        }
-        
-        // Check if process is dead
-        let isDead = false;
-        if (lockPid) {
-          try {
-            process.kill(parseInt(lockPid, 10), 0);
-          } catch (e) {
-            if (e.code === 'ESRCH') isDead = true;
-          }
-        }
-        
-        if (isDead) {
-          await logMessage(`Removing orphaned lock (PID ${lockPid} no longer running)`);
-          await fs.rm(LOCK_DIR, { recursive: true, force: true });
-          continue;
-        }
-      } catch (e) {
-        // info file might not exist yet due to brief race condition
-      }
-      
-      // Wait before retrying
-      await new Promise(r => setTimeout(r, 5000));
-    }
-  }
-}
+// ───────────────────────────────────────────────────────────
+// Persistent API Connection
+// ───────────────────────────────────────────────────────────
+let api = null;
+let apiInitialized = false;
+let budgetLoaded = false;
+let rcConfig = null;
 
-async function releaseLock() {
-  try {
-    await fs.rm(LOCK_DIR, { recursive: true, force: true });
-  } catch (e) {
-    // Ignore errors
-  }
-}
-
-// Helper: Read ActualRC
 async function readActualRc() {
   try {
     const data = await fs.readFile(ACTUAL_RC_PATH, 'utf8');
@@ -126,112 +53,967 @@ async function readActualRc() {
   }
 }
 
-// Helper: Cache Workaround
-async function runCacheWorkaround(rc) {
-  if (rc.encryptionPassword && rc.dataDir && rc.syncId) {
-    const cacheState = path.join(rc.dataDir, '.actual-cli', rc.syncId, 'state.json');
-    try {
-      await fs.unlink(cacheState);
-    } catch (e) {
-      // Ignore if not exists
+async function ensureInit() {
+  if (apiInitialized) return;
+  
+  // Dynamic import of @actual-app/api
+  api = await import('@actual-app/api');
+  rcConfig = await readActualRc();
+  
+  const initOpts = {
+    serverURL: rcConfig.serverUrl,
+    dataDir: rcConfig.dataDir || path.join(os.homedir(), '.actual-data'),
+  };
+  
+  if (rcConfig.password) {
+    initOpts.password = rcConfig.password;
+  }
+  
+  await logMessage('API init: connecting to server...');
+  await api.init(initOpts);
+  apiInitialized = true;
+  await logMessage('API init: connected');
+}
+
+async function ensureBudget() {
+  await ensureInit();
+  if (budgetLoaded) return;
+  
+  if (!rcConfig.syncId) {
+    throw new Error('syncId not found in .actualrc.json — cannot load budget');
+  }
+  
+  await logMessage(`Downloading budget ${rcConfig.syncId}...`);
+  await api.downloadBudget(rcConfig.syncId, {
+    password: rcConfig.encryptionPassword,
+  });
+  budgetLoaded = true;
+  await logMessage('Budget loaded');
+}
+
+// ───────────────────────────────────────────────────────────
+// In-memory Cache
+// ───────────────────────────────────────────────────────────
+const cache = {
+  accounts: null,
+  categories: null,
+  categoryGroups: null,
+  payees: null,
+  tags: null,
+};
+
+function invalidateCache() {
+  cache.accounts = null;
+  cache.categories = null;
+  cache.categoryGroups = null;
+  cache.payees = null;
+  cache.tags = null;
+}
+
+async function getCachedAccounts() {
+  if (!cache.accounts) {
+    cache.accounts = await api.getAccounts();
+  }
+  return cache.accounts;
+}
+
+async function getCachedCategories() {
+  if (!cache.categories) {
+    cache.categories = await api.getCategories();
+  }
+  return cache.categories;
+}
+
+async function getCachedCategoryGroups() {
+  if (!cache.categoryGroups) {
+    cache.categoryGroups = await api.getCategoryGroups();
+  }
+  return cache.categoryGroups;
+}
+
+async function getCachedPayees() {
+  if (!cache.payees) {
+    cache.payees = await api.getPayees();
+  }
+  return cache.payees;
+}
+
+async function getCachedTags() {
+  if (!cache.tags) {
+    cache.tags = await api.getTags();
+  }
+  return cache.tags;
+}
+
+// ───────────────────────────────────────────────────────────
+// Argument Parsing Helpers (compatible with CLI-style args)
+// ───────────────────────────────────────────────────────────
+function parseArgs(args) {
+  const result = { _positional: [] };
+  let i = 0;
+  while (i < args.length) {
+    const arg = args[i];
+    if (arg.startsWith('--')) {
+      const key = arg.slice(2);
+      // Boolean flags (no value following)
+      if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+        result[key] = true;
+        i++;
+      } else {
+        result[key] = args[i + 1];
+        i += 2;
+      }
+    } else {
+      result._positional.push(arg);
+      i++;
     }
+  }
+  return result;
+}
+
+function parseBoolFlag(value, flagName) {
+  if (value === true || value === 'true') return true;
+  if (value === false || value === 'false') return false;
+  throw new Error(`Invalid ${flagName}: "${value}". Expected "true" or "false".`);
+}
+
+function parseIntFlag(value, flagName) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`Invalid ${flagName}: "${value}". Expected an integer.`);
+  }
+  return parsed;
+}
+
+function readJsonInput(parsed) {
+  if (parsed.data && parsed.file) {
+    throw new Error('Cannot use both --data and --file');
+  }
+  if (parsed.data) {
+    return JSON.parse(parsed.data);
+  }
+  if (parsed.file) {
+    const content = parsed.file === '-'
+      ? fsSync.readFileSync(0, 'utf-8')
+      : fsSync.readFileSync(parsed.file, 'utf-8');
+    return JSON.parse(content);
+  }
+  throw new Error('Either --data or --file is required');
+}
+
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// ───────────────────────────────────────────────────────────
+// Output Formatting (matches CLI output exactly)
+// ───────────────────────────────────────────────────────────
+function formatOutput(data, format = 'json') {
+  switch (format) {
+    case 'json':
+      return JSON.stringify(data, null, 2);
+    case 'csv':
+      return formatCsv(data);
+    case 'table':
+      // For MCP, just use JSON since table rendering isn't useful
+      return JSON.stringify(data, null, 2);
+    default:
+      return JSON.stringify(data, null, 2);
   }
 }
 
-// Helper: Spawn Command
-function spawnCommand(args) {
-  return new Promise((resolve) => {
-    const child = spawn('actual', args, { cwd: os.homedir(), env: extendedEnv });
-    let stdout = '';
-    let stderr = '';
-    
-    child.stdout.on('data', (data) => { stdout += data.toString(); });
-    child.stderr.on('data', (data) => { stderr += data.toString(); });
-    
-    child.on('close', (code) => {
-      resolve({ code, stdout, stderr });
-    });
-    
-    child.on('error', (err) => {
-      resolve({ code: -1, stdout: '', stderr: err.message });
-    });
+const AMOUNT_FIELDS = new Set([
+  'amount', 'balance', 'balance_available', 'balance_current',
+  'balance_limit', 'budgeted', 'spent', 'carryover',
+]);
+
+function formatCellValue(key, value) {
+  if (AMOUNT_FIELDS.has(key) && typeof value === 'number') {
+    return (value / 100).toFixed(2);
+  }
+  return String(value ?? '');
+}
+
+function escapeCsv(value) {
+  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+    return '"' + value.replace(/"/g, '""') + '"';
+  }
+  return value;
+}
+
+function formatCsv(data) {
+  if (!Array.isArray(data)) {
+    if (data && typeof data === 'object') {
+      const entries = Object.entries(data);
+      const header = entries.map(([k]) => escapeCsv(k)).join(',');
+      const values = entries.map(([k, v]) => escapeCsv(formatCellValue(k, v))).join(',');
+      return header + '\n' + values;
+    }
+    return String(data);
+  }
+  if (data.length === 0) return '';
+  const keys = Object.keys(data[0]);
+  const header = keys.map(k => escapeCsv(k)).join(',');
+  const rows = data.map(row => {
+    return keys.map(k => escapeCsv(formatCellValue(k, row[k]))).join(',');
+  });
+  return [header, ...rows].join('\n');
+}
+
+// ───────────────────────────────────────────────────────────
+// AQL Query Builder (matches CLI query command exactly)
+// ───────────────────────────────────────────────────────────
+const TABLE_SCHEMA = {
+  transactions: {
+    id: { type: 'id' },
+    account: { type: 'id', ref: 'accounts' },
+    date: { type: 'date' },
+    amount: { type: 'integer' },
+    payee: { type: 'id', ref: 'payees' },
+    category: { type: 'id', ref: 'categories' },
+    notes: { type: 'string' },
+    imported_id: { type: 'string' },
+    transfer_id: { type: 'id' },
+    cleared: { type: 'boolean' },
+    reconciled: { type: 'boolean' },
+    starting_balance_flag: { type: 'boolean' },
+    imported_payee: { type: 'string' },
+    is_parent: { type: 'boolean' },
+    is_child: { type: 'boolean' },
+    parent_id: { type: 'id' },
+    sort_order: { type: 'float' },
+    schedule: { type: 'id', ref: 'schedules' },
+    'account.name': { type: 'string', ref: 'accounts' },
+    'payee.name': { type: 'string', ref: 'payees' },
+    'category.name': { type: 'string', ref: 'categories' },
+    'category.group.name': { type: 'string', ref: 'category_groups' },
+  },
+  accounts: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    offbudget: { type: 'boolean' },
+    closed: { type: 'boolean' },
+    sort_order: { type: 'float' },
+  },
+  categories: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    is_income: { type: 'boolean' },
+    group_id: { type: 'id', ref: 'category_groups' },
+    sort_order: { type: 'float' },
+    hidden: { type: 'boolean' },
+    'group.name': { type: 'string', ref: 'category_groups' },
+  },
+  payees: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    transfer_acct: { type: 'id', ref: 'accounts' },
+  },
+  rules: {
+    id: { type: 'id' },
+    stage: { type: 'string' },
+    conditions_op: { type: 'string' },
+    conditions: { type: 'json' },
+    actions: { type: 'json' },
+  },
+  schedules: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    rule: { type: 'id', ref: 'rules' },
+    next_date: { type: 'date' },
+    completed: { type: 'boolean' },
+  },
+};
+
+const AVAILABLE_TABLES = Object.keys(TABLE_SCHEMA).join(', ');
+
+const LAST_DEFAULT_SELECT = [
+  'date', 'account.name', 'payee.name', 'category.name', 'amount', 'notes',
+];
+
+function parseOrderBy(input) {
+  return input.split(',').map(part => {
+    const trimmed = part.trim();
+    if (!trimmed) throw new Error('--order-by contains an empty field');
+    const colonIndex = trimmed.indexOf(':');
+    if (colonIndex === -1) return trimmed;
+    const field = trimmed.slice(0, colonIndex).trim();
+    if (!field) throw new Error(`Invalid order field in "${trimmed}". Field name cannot be empty.`);
+    const direction = trimmed.slice(colonIndex + 1);
+    if (direction !== 'asc' && direction !== 'desc') {
+      throw new Error(`Invalid order direction "${direction}" for field "${field}". Expected "asc" or "desc".`);
+    }
+    return { [field]: direction };
   });
 }
 
-// Helper: Reset budget cache
-async function resetBudgetCache() {
-  await logMessage('ACTUAL BUDGET CLI RESET');
-  const rc = await readActualRc();
-  if (!rc.dataDir) {
-    throw new Error(`Error: dataDir not found in ${ACTUAL_RC_PATH}`);
-  }
-  
-  // Find and remove budget directories
-  try {
-    const files = await fs.readdir(rc.dataDir, { withFileTypes: true });
-    for (const file of files) {
-      if (file.isDirectory()) {
-        const budgetDir = path.join(rc.dataDir, file.name);
-        try {
-          const dbPath = path.join(budgetDir, 'db.sqlite');
-          await fs.access(dbPath); // Check if db.sqlite exists
-          await logMessage(`Removing budget cache directory: ${budgetDir}`);
-          await fs.rm(budgetDir, { recursive: true, force: true });
-        } catch (e) {
-          // No db.sqlite or permission error, skip
-        }
-      }
+function buildQuery(opts) {
+  const last = opts.last ? parseIntFlag(opts.last, '--last') : undefined;
+
+  if (last !== undefined) {
+    if (opts.table && opts.table !== 'transactions') {
+      throw new Error('--last implies --table transactions. Cannot use with --table ' + opts.table);
     }
-  } catch (e) {
-    // Directory might not exist yet
-  }
-  
-  if (rc.syncId) {
-    await logMessage(`Downloading budget ${rc.syncId}...`);
-    const args = ['budgets', 'download', rc.syncId];
-    if (rc.encryptionPassword) {
-      args.push('--encryption-password', rc.encryptionPassword);
+    if (opts.limit) {
+      throw new Error('--last and --limit are mutually exclusive');
     }
-    await spawnCommand(args);
   }
-  
-  await logMessage('Refetching accounts...');
-  await spawnCommand(['accounts', 'list']);
+
+  const table = opts.table ?? (last !== undefined ? 'transactions' : undefined);
+  if (!table) throw new Error('--table is required (or use --file or --last)');
+  if (!(table in TABLE_SCHEMA)) {
+    throw new Error(`Unknown table "${table}". Available tables: ${AVAILABLE_TABLES}`);
+  }
+
+  if (opts.where && opts.filter) {
+    throw new Error('--where and --filter are mutually exclusive');
+  }
+  if (opts.count && opts.select) {
+    throw new Error('--count and --select are mutually exclusive');
+  }
+
+  let queryObj = api.q(table);
+
+  if (opts.count) {
+    queryObj = queryObj.calculate({ $count: '*' });
+  } else if (opts.select) {
+    queryObj = queryObj.select(opts.select.split(','));
+  } else if (last !== undefined) {
+    queryObj = queryObj.select(LAST_DEFAULT_SELECT);
+  }
+
+  const filterStr = opts.filter ?? opts.where;
+  if (filterStr) {
+    queryObj = queryObj.filter(JSON.parse(filterStr));
+  }
+
+  const orderByStr = opts['order-by'] ??
+    (last !== undefined && !opts.count ? 'date:desc' : undefined);
+  if (orderByStr) {
+    queryObj = queryObj.orderBy(parseOrderBy(orderByStr));
+  }
+
+  const limitVal = last ??
+    (opts.limit ? parseIntFlag(opts.limit, '--limit') : undefined);
+  if (limitVal !== undefined) {
+    queryObj = queryObj.limit(limitVal);
+  }
+
+  if (opts.offset) {
+    queryObj = queryObj.offset(parseIntFlag(opts.offset, '--offset'));
+  }
+
+  if (opts['group-by']) {
+    queryObj = queryObj.groupBy(opts['group-by'].split(','));
+  }
+
+  return queryObj;
 }
 
-// Main execution block with retries
-async function executeWithRetry(args) {
-  await acquireLock();
-  try {
-    await logMessage(`actual ${args.join(' ')}`);
-    const rc = await readActualRc();
-    await runCacheWorkaround(rc);
-    
-    const maxRetries = parseInt(process.env.ACTUAL_MAX_RETRIES || '1', 10);
-    let attempt = 0;
-    
-    while (true) {
-      const { code, stdout, stderr } = await spawnCommand(args);
-      
-      if (code !== 0 && RETRYABLE_ERRORS.test(stderr)) {
-        attempt++;
-        if (attempt <= maxRetries) {
-          await logMessage(`SQLite error detected, resetting and retrying (attempt ${attempt}/${maxRetries})...`);
-          await resetBudgetCache();
-          await new Promise(r => setTimeout(r, 2000));
-          continue;
-        } else {
-          await logMessage(`SQLite error persisted after ${maxRetries} retry attempt(s), giving up`);
-          return { code, stdout, stderr };
-        }
-      }
-      
-      return { code, stdout, stderr };
+function buildQueryFromFile(parsed, fallbackTable) {
+  const table = typeof parsed.table === 'string' ? parsed.table : fallbackTable;
+  if (!table) throw new Error('--table is required when the input file lacks a "table" field');
+  let queryObj = api.q(table);
+  if (Array.isArray(parsed.select)) queryObj = queryObj.select(parsed.select);
+  if (isRecord(parsed.filter)) queryObj = queryObj.filter(parsed.filter);
+  if (Array.isArray(parsed.orderBy)) queryObj = queryObj.orderBy(parsed.orderBy);
+  if (typeof parsed.limit === 'number') queryObj = queryObj.limit(parsed.limit);
+  if (typeof parsed.offset === 'number') queryObj = queryObj.offset(parsed.offset);
+  if (Array.isArray(parsed.groupBy)) queryObj = queryObj.groupBy(parsed.groupBy);
+  return queryObj;
+}
+
+// ───────────────────────────────────────────────────────────
+// Command Handlers — Direct API calls, no subprocess spawning
+// ───────────────────────────────────────────────────────────
+
+async function handleAccounts(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      const allAccounts = await getCachedAccounts();
+      const accounts = allAccounts.filter(a => opts['include-closed'] || !a.closed);
+      accounts.sort((a, b) => Number(a.offbudget) - Number(b.offbudget));
+      const balances = await Promise.all(accounts.map(a => api.getAccountBalance(a.id)));
+      return accounts.map((a, i) => ({
+        id: a.id, name: a.name, offbudget: a.offbudget, closed: a.closed, balance: balances[i],
+      }));
     }
-  } finally {
-    await releaseLock();
+    case 'create': {
+      await ensureBudget();
+      const balance = opts.balance ? parseIntFlag(opts.balance, '--balance') : 0;
+      const id = await api.createAccount(
+        { name: opts.name, offbudget: !!opts.offbudget },
+        balance,
+      );
+      cache.accounts = null;
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Account ID is required');
+      const fields = {};
+      if (opts.name !== undefined) {
+        const trimmed = opts.name.trim();
+        if (trimmed === '') throw new Error('Invalid --name: must be a non-empty string.');
+        fields.name = trimmed;
+      }
+      if (opts.offbudget !== undefined) {
+        fields.offbudget = parseBoolFlag(opts.offbudget, '--offbudget');
+      }
+      if (Object.keys(fields).length === 0) {
+        throw new Error('No update fields provided. Use --name or --offbudget.');
+      }
+      await api.updateAccount(id, fields);
+      cache.accounts = null;
+      return { success: true, id };
+    }
+    case 'close': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Account ID is required');
+      await api.closeAccount(id, opts['transfer-account'], opts['transfer-category']);
+      cache.accounts = null;
+      return { success: true, id };
+    }
+    case 'reopen': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Account ID is required');
+      await api.reopenAccount(id);
+      cache.accounts = null;
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Account ID is required');
+      await api.deleteAccount(id);
+      cache.accounts = null;
+      return { success: true, id };
+    }
+    case 'balance': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Account ID is required');
+      let cutoff;
+      if (opts.cutoff) {
+        const cutoffDate = new Date(opts.cutoff);
+        if (Number.isNaN(cutoffDate.getTime())) {
+          throw new Error('Invalid cutoff date: expected a valid date (e.g. YYYY-MM-DD).');
+        }
+        cutoff = cutoffDate;
+      }
+      const balance = await api.getAccountBalance(id, cutoff);
+      return { id, balance };
+    }
+    default:
+      throw new Error(`Unknown accounts subcommand: ${subCmd}`);
   }
 }
+
+async function handleBudgets(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      // budgets list doesn't need budget loaded, just server connection
+      await ensureInit();
+      const result = await api.getBudgets();
+      return result;
+    }
+    case 'download': {
+      await ensureInit();
+      const syncId = opts._positional[0];
+      if (!syncId) throw new Error('syncId is required');
+      const password = opts['encryption-password'] || rcConfig.encryptionPassword;
+      await api.downloadBudget(syncId, { password });
+      budgetLoaded = true;
+      invalidateCache();
+      return { success: true, syncId };
+    }
+    case 'months': {
+      await ensureBudget();
+      return await api.getBudgetMonths();
+    }
+    case 'month': {
+      await ensureBudget();
+      const month = opts._positional[0];
+      if (!month) throw new Error('Month (YYYY-MM) is required');
+      return await api.getBudgetMonth(month);
+    }
+    case 'set-amount': {
+      await ensureBudget();
+      const amount = parseIntFlag(opts.amount, '--amount');
+      await api.setBudgetAmount(opts.month, opts.category, amount);
+      return { success: true };
+    }
+    case 'set-carryover': {
+      await ensureBudget();
+      const flag = parseBoolFlag(opts.flag, '--flag');
+      await api.setBudgetCarryover(opts.month, opts.category, flag);
+      return { success: true };
+    }
+    case 'hold-next-month': {
+      await ensureBudget();
+      const amount = parseIntFlag(opts.amount, '--amount');
+      await api.holdBudgetForNextMonth(opts.month, amount);
+      return { success: true };
+    }
+    case 'reset-hold': {
+      await ensureBudget();
+      await api.resetBudgetHold(opts.month);
+      return { success: true };
+    }
+    default:
+      throw new Error(`Unknown budgets subcommand: ${subCmd}`);
+  }
+}
+
+async function handleTransactions(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      if (!opts.account) throw new Error('--account is required');
+      if (!opts.start) throw new Error('--start is required');
+      if (!opts.end) throw new Error('--end is required');
+      return await api.getTransactions(opts.account, opts.start, opts.end);
+    }
+    case 'add': {
+      await ensureBudget();
+      if (!opts.account) throw new Error('--account is required');
+      const transactions = readJsonInput(opts);
+      const result = await api.addTransactions(opts.account, transactions, {
+        learnCategories: !!opts['learn-categories'],
+        runTransfers: !!opts['run-transfers'],
+      });
+      return result;
+    }
+    case 'import': {
+      await ensureBudget();
+      if (!opts.account) throw new Error('--account is required');
+      const transactions = readJsonInput(opts);
+      const result = await api.importTransactions(opts.account, transactions, {
+        defaultCleared: true,
+        dryRun: !!opts['dry-run'],
+      });
+      return result;
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Transaction ID is required');
+      const fields = readJsonInput(opts);
+      await api.updateTransaction(id, fields);
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Transaction ID is required');
+      await api.deleteTransaction(id);
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown transactions subcommand: ${subCmd}`);
+  }
+}
+
+async function handleCategories(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await getCachedCategories();
+    }
+    case 'create': {
+      await ensureBudget();
+      if (!opts.name) throw new Error('--name is required');
+      if (!opts['group-id']) throw new Error('--group-id is required');
+      const id = await api.createCategory({
+        name: opts.name,
+        group_id: opts['group-id'],
+        is_income: !!opts['is-income'],
+        hidden: false,
+      });
+      cache.categories = null;
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Category ID is required');
+      const fields = {};
+      if (opts.name !== undefined) fields.name = opts.name;
+      if (opts.hidden !== undefined) fields.hidden = parseBoolFlag(opts.hidden, '--hidden');
+      if (Object.keys(fields).length === 0) {
+        throw new Error('No update fields provided. Use --name or --hidden.');
+      }
+      await api.updateCategory(id, fields);
+      cache.categories = null;
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Category ID is required');
+      await api.deleteCategory(id, opts['transfer-to']);
+      cache.categories = null;
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown categories subcommand: ${subCmd}`);
+  }
+}
+
+async function handleCategoryGroups(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await getCachedCategoryGroups();
+    }
+    case 'create': {
+      await ensureBudget();
+      if (!opts.name) throw new Error('--name is required');
+      const id = await api.createCategoryGroup({
+        name: opts.name,
+        is_income: !!opts['is-income'],
+        hidden: false,
+      });
+      cache.categoryGroups = null;
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Category group ID is required');
+      const fields = {};
+      if (opts.name !== undefined) fields.name = opts.name;
+      if (opts.hidden !== undefined) fields.hidden = parseBoolFlag(opts.hidden, '--hidden');
+      if (Object.keys(fields).length === 0) {
+        throw new Error('No update fields provided. Use --name or --hidden.');
+      }
+      await api.updateCategoryGroup(id, fields);
+      cache.categoryGroups = null;
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Category group ID is required');
+      await api.deleteCategoryGroup(id, opts['transfer-to']);
+      cache.categoryGroups = null;
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown category-groups subcommand: ${subCmd}`);
+  }
+}
+
+async function handlePayees(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await getCachedPayees();
+    }
+    case 'common': {
+      await ensureBudget();
+      return await api.getCommonPayees();
+    }
+    case 'create': {
+      await ensureBudget();
+      if (!opts.name) throw new Error('--name is required');
+      const id = await api.createPayee({ name: opts.name });
+      cache.payees = null;
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Payee ID is required');
+      const fields = {};
+      if (opts.name) fields.name = opts.name;
+      if (Object.keys(fields).length === 0) {
+        throw new Error('No fields to update. Use --name to specify a new name.');
+      }
+      await api.updatePayee(id, fields);
+      cache.payees = null;
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Payee ID is required');
+      await api.deletePayee(id);
+      cache.payees = null;
+      return { success: true, id };
+    }
+    case 'merge': {
+      await ensureBudget();
+      if (!opts.target) throw new Error('--target is required');
+      if (!opts.ids) throw new Error('--ids is required');
+      const mergeIds = opts.ids.split(',').map(id => id.trim()).filter(id => id.length > 0);
+      if (mergeIds.length === 0) {
+        throw new Error('No valid payee IDs provided in --ids.');
+      }
+      await api.mergePayees(opts.target, mergeIds);
+      cache.payees = null;
+      return { success: true };
+    }
+    default:
+      throw new Error(`Unknown payees subcommand: ${subCmd}`);
+  }
+}
+
+async function handleTags(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await getCachedTags();
+    }
+    case 'create': {
+      await ensureBudget();
+      if (!opts.tag) throw new Error('--tag is required');
+      const id = await api.createTag({
+        tag: opts.tag,
+        color: opts.color,
+        description: opts.description,
+      });
+      cache.tags = null;
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Tag ID is required');
+      const fields = {};
+      if (opts.tag !== undefined) fields.tag = opts.tag;
+      if (opts.color !== undefined) fields.color = opts.color;
+      if (opts.description !== undefined) fields.description = opts.description;
+      if (Object.keys(fields).length === 0) {
+        throw new Error('At least one of --tag, --color, or --description is required');
+      }
+      await api.updateTag(id, fields);
+      cache.tags = null;
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Tag ID is required');
+      await api.deleteTag(id);
+      cache.tags = null;
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown tags subcommand: ${subCmd}`);
+  }
+}
+
+async function handleRules(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await api.getRules();
+    }
+    case 'payee-rules': {
+      await ensureBudget();
+      const payeeId = opts._positional[0];
+      if (!payeeId) throw new Error('Payee ID is required');
+      return await api.getPayeeRules(payeeId);
+    }
+    case 'create': {
+      await ensureBudget();
+      const rule = readJsonInput(opts);
+      const id = await api.createRule(rule);
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const rule = readJsonInput(opts);
+      await api.updateRule(rule);
+      return { success: true };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Rule ID is required');
+      await api.deleteRule(id);
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown rules subcommand: ${subCmd}`);
+  }
+}
+
+async function handleSchedules(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await api.getSchedules();
+    }
+    case 'create': {
+      await ensureBudget();
+      const schedule = readJsonInput(opts);
+      const id = await api.createSchedule(schedule);
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Schedule ID is required');
+      const fields = readJsonInput(opts);
+      await api.updateSchedule(id, fields, !!opts['reset-next-date']);
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0];
+      if (!id) throw new Error('Schedule ID is required');
+      await api.deleteSchedule(id);
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown schedules subcommand: ${subCmd}`);
+  }
+}
+
+async function handleSync(subCmd, opts) {
+  if (opts.status || subCmd === 'status') {
+    // We don't have a direct equivalent; just report that connection is alive
+    await ensureBudget();
+    return { status: 'connected', budgetLoaded: true };
+  }
+  if (opts.clear || subCmd === 'clear') {
+    // Reset everything
+    budgetLoaded = false;
+    invalidateCache();
+    if (api && apiInitialized) {
+      try { await api.shutdown(); } catch (e) { /* ignore */ }
+    }
+    apiInitialized = false;
+    api = null;
+    return { success: true, message: 'Cache cleared. Will reconnect on next call.' };
+  }
+  // Default: sync
+  await ensureBudget();
+  await api.sync();
+  invalidateCache();
+  return { success: true };
+}
+
+async function handleQuery(subCmd, opts) {
+  switch (subCmd) {
+    case 'tables': {
+      return Object.keys(TABLE_SCHEMA).map(name => ({ name }));
+    }
+    case 'fields': {
+      const table = opts._positional[0];
+      if (!table) throw new Error('Table name is required');
+      const schema = TABLE_SCHEMA[table];
+      if (!schema) {
+        throw new Error(`Unknown table "${table}". Available tables: ${AVAILABLE_TABLES}`);
+      }
+      return Object.entries(schema).map(([name, info]) => ({
+        name, type: info.type, ...(info.ref ? { ref: info.ref } : {}),
+      }));
+    }
+    case 'run': {
+      await ensureBudget();
+      let queryObj;
+      if (opts.file) {
+        const parsed = readJsonInput(opts);
+        if (!isRecord(parsed)) throw new Error('Query file must contain a JSON object');
+        queryObj = buildQueryFromFile(parsed, opts.table);
+      } else {
+        queryObj = buildQuery(opts);
+      }
+      const result = await api.aqlQuery(queryObj);
+      if (!isRecord(result) || !('data' in result)) {
+        throw new Error('Query result missing data');
+      }
+      if (opts.count) {
+        return { count: result.data };
+      }
+      return result.data;
+    }
+    default:
+      throw new Error(`Unknown query subcommand: ${subCmd}`);
+  }
+}
+
+async function handleServer(subCmd, opts) {
+  switch (subCmd) {
+    case 'version': {
+      await ensureInit(); // server version doesn't need budget
+      const version = await api.getServerVersion();
+      return { version };
+    }
+    case 'get-id': {
+      await ensureBudget();
+      if (!opts.type) throw new Error('--type is required');
+      if (!opts.name) throw new Error('--name is required');
+      const id = await api.getIDByName(opts.type, opts.name);
+      return { id, type: opts.type, name: opts.name };
+    }
+    case 'bank-sync': {
+      await ensureBudget();
+      const args = opts.account ? { accountId: opts.account } : undefined;
+      await api.runBankSync(args);
+      return { success: true };
+    }
+    default:
+      throw new Error(`Unknown server subcommand: ${subCmd}`);
+  }
+}
+
+// ───────────────────────────────────────────────────────────
+// Command Router
+// ───────────────────────────────────────────────────────────
+const COMMAND_HANDLERS = {
+  accounts: handleAccounts,
+  budgets: handleBudgets,
+  transactions: handleTransactions,
+  categories: handleCategories,
+  'category-groups': handleCategoryGroups,
+  payees: handlePayees,
+  tags: handleTags,
+  rules: handleRules,
+  schedules: handleSchedules,
+  sync: handleSync,
+  query: handleQuery,
+  server: handleServer,
+};
+
+async function executeCommand(cliArgs) {
+  const command = cliArgs[0];
+  if (!command) throw new Error('No command specified');
+  
+  const handler = COMMAND_HANDLERS[command];
+  if (!handler) throw new Error(`Unknown command: ${command}`);
+  
+  // Parse subcommand and options
+  const remaining = cliArgs.slice(1);
+  const parsed = parseArgs(remaining);
+  const subCmd = parsed._positional[0];
+  // For commands like sync that may not have a subcommand
+  const positionalAfterSub = parsed._positional.slice(1);
+  
+  // Re-parse with subcommand consumed
+  const opts = { ...parsed, _positional: positionalAfterSub };
+  
+  await logMessage(`${command} ${remaining.join(' ')}`);
+  const startTime = Date.now();
+  
+  const result = await handler(subCmd || '', opts);
+  
+  const elapsed = Date.now() - startTime;
+  await logMessage(`${command} completed in ${elapsed}ms`);
+  
+  return result;
+}
+
+// ───────────────────────────────────────────────────────────
+// MCP Server Setup
+// ───────────────────────────────────────────────────────────
 
 const COMMAND_SCHEMAS = {
   accounts: {
@@ -354,6 +1136,17 @@ const COMMAND_SCHEMAS = {
 
 const CLI_COMMANDS = Object.keys(COMMAND_SCHEMAS);
 
+const server = new Server({
+  name: "actual-cli-mcp",
+  version: "2.0.0"
+}, {
+  capabilities: {
+    tools: {},
+    resources: {},
+    prompts: {}
+  }
+});
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools = Object.entries(COMMAND_SCHEMAS).map(([cmd, schema]) => ({
     name: `actual_${cmd.replace(/-/g, '_')}`,
@@ -371,7 +1164,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     }
   }));
 
-  // Add the generic actual_execute tool back just in case
+  // Add the generic actual_execute tool
   tools.push({
     name: "actual_execute",
     description: "Execute a generic command using the Actual Budget CLI. E.g., args: ['help'].",
@@ -463,6 +1256,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   
   let cliArgs = args.args || [];
   
+  // Extract format from args (--format json|csv|table)
+  let format = 'json';
+  const formatIdx = cliArgs.indexOf('--format');
+  if (formatIdx !== -1 && formatIdx + 1 < cliArgs.length) {
+    format = cliArgs[formatIdx + 1];
+    // Remove --format from args so handlers don't see it
+    cliArgs = [...cliArgs.slice(0, formatIdx), ...cliArgs.slice(formatIdx + 2)];
+  }
+  
+  // Remove --verbose flag (we log to file instead)
+  const verboseIdx = cliArgs.indexOf('--verbose');
+  if (verboseIdx !== -1) {
+    cliArgs = [...cliArgs.slice(0, verboseIdx), ...cliArgs.slice(verboseIdx + 1)];
+  }
+  
   // If a specific tool is called, prepend the command name
   if (name.startsWith('actual_') && name !== 'actual_execute') {
     const cmd = name.replace('actual_', '').replace(/_/g, '-');
@@ -475,34 +1283,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw new Error(`Unknown tool: ${name}`);
   }
   
-  const { code, stdout, stderr } = await executeWithRetry(cliArgs);
-  
-  const textParts = [];
-  if (stdout) {
-    textParts.push(stdout);
+  try {
+    const result = await executeCommand(cliArgs);
+    const output = formatOutput(result, format);
+    return {
+      content: [{ type: "text", text: output }],
+      isError: false,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await logMessage(`ERROR: ${message}`);
+    return {
+      content: [{ type: "text", text: `Error: ${message}` }],
+      isError: true,
+    };
   }
-  if (stderr) {
-    textParts.push(`Standard Error:\n${stderr}`);
-  }
-  if (code !== 0) {
-    textParts.push(`Process exited with code ${code}`);
-  }
-  
-  return {
-    content: [
-      {
-        type: "text",
-        text: textParts.join('\n\n') || "Command executed successfully with no output."
-      }
-    ],
-    isError: code !== 0
-  };
 });
 
+// ───────────────────────────────────────────────────────────
+// Startup
+// ───────────────────────────────────────────────────────────
 async function run() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Actual CLI MCP server running on stdio");
+  console.error("Actual Budget MCP server v2.0.0 running (direct API mode)");
 }
 
 run().catch(console.error);
