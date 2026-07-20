@@ -11,6 +11,7 @@ import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
 import os from "os";
+import { execSync } from "child_process";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -613,6 +614,93 @@ async function handleTransactions(subCmd, opts) {
       await api.deleteTransaction(id);
       return { success: true, id };
     }
+    case 'restore-notes': {
+      await ensureBudget();
+      const ids = opts._positional.length > 0 ? opts._positional : (opts.ids ? opts.ids.split(',') : []);
+      if (!ids || ids.length === 0) throw new Error('Transaction IDs are required as positional arguments');
+      
+      const idsList = ids.map(id => `'${id}'`).join(', ');
+      const query = `SELECT id, notes FROM transactions WHERE id IN (${idsList});`;
+      const output = execSync(`sqlite3 -json backup.sqlite "${query}"`, { encoding: 'utf8' });
+      
+      let rows = [];
+      try {
+        if (output.trim()) {
+          rows = JSON.parse(output);
+        }
+      } catch (e) {
+        throw new Error('Failed to parse sqlite output: ' + e.message);
+      }
+      
+      const notesMap = {};
+      for (const row of rows) {
+        notesMap[row.id] = row.notes;
+      }
+      
+      let restoredCount = 0;
+      const results = [];
+      for (const id of ids) {
+        const notes = notesMap[id];
+        if (notes != null) {
+          await api.updateTransaction(id, { notes });
+          restoredCount++;
+          results.push({ id, status: 'restored', notes });
+        } else {
+          results.push({ id, status: 'skipped (not found)' });
+        }
+      }
+      return { success: true, restoredCount, results };
+    }
+    case 'restore-transaction': {
+      await ensureBudget();
+      const ids = opts._positional.length > 0 ? opts._positional : (opts.ids ? opts.ids.split(',') : []);
+      if (!ids || ids.length === 0) throw new Error('Transaction IDs are required as positional arguments');
+      
+      const idsList = ids.map(id => `'${id}'`).join(', ');
+      const query = `SELECT * FROM transactions WHERE id IN (${idsList});`;
+      const output = execSync(`sqlite3 -json backup.sqlite "${query}"`, { encoding: 'utf8' });
+      
+      let rows = [];
+      try {
+        if (output.trim()) {
+          rows = JSON.parse(output);
+        }
+      } catch (e) {
+        throw new Error('Failed to parse sqlite output: ' + e.message);
+      }
+      
+      let restoredCount = 0;
+      const results = [];
+      for (const row of rows) {
+        const apiTx = {};
+        if (row.acct) apiTx.account = row.acct;
+        if (row.amount != null) apiTx.amount = row.amount;
+        if (row.category) apiTx.category = row.category;
+        if (row.description) apiTx.payee = row.description;
+        apiTx.notes = row.notes || '';
+        if (row.date) {
+          const d = String(row.date);
+          if (d.length === 8) {
+            apiTx.date = `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+          }
+        }
+        if (row.cleared != null) apiTx.cleared = Boolean(row.cleared);
+        
+        await api.updateTransaction(row.id, apiTx);
+        restoredCount++;
+        results.push({ id: row.id, status: 'restored', fields: apiTx });
+      }
+      
+      // Check for missing ids
+      const foundIds = new Set(rows.map(r => r.id));
+      for (const id of ids) {
+        if (!foundIds.has(id)) {
+          results.push({ id, status: 'skipped (not found)' });
+        }
+      }
+      
+      return { success: true, restoredCount, results };
+    }
     default:
       throw new Error(`Unknown transactions subcommand: ${subCmd}`);
   }
@@ -1048,8 +1136,10 @@ const COMMAND_SCHEMAS = {
              "- add --account <id> (--data <json> | --file <path>) [--learn-categories] [--run-transfers]\n" +
              "- import --account <id> (--data <json> | --file <path>) [--dry-run]\n" +
              "- update <id> (--data <json> | --file <path>)\n" +
-             "- delete <id>",
-    rules: "Rules:\n- list: ALL of `--account`, `--start`, and `--end` are absolutely required or the command will fail.\n- add/import: MUST provide `--account` and either `--data` (as JSON string) or `--file`.\n- update: Takes the transaction ID as a positional argument. The `--data` flag must contain fields to update."
+             "- delete <id>\n" +
+             "- restore-notes <id1> <id2> ...\n" +
+             "- restore-transaction <id1> <id2> ...",
+    rules: "Rules:\n- list: ALL of `--account`, `--start`, and `--end` are absolutely required or the command will fail.\n- add/import: MUST provide `--account` and either `--data` (as JSON string) or `--file`.\n- update: Takes the transaction ID as a positional argument. The `--data` flag must contain fields to update.\n- restore-notes: Takes a list of transaction IDs and restores their notes from backup.sqlite.\n- restore-transaction: Takes a list of transaction IDs and restores all fields from backup.sqlite."
   },
   categories: {
     desc: "Manage categories.",
