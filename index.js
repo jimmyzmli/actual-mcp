@@ -84,12 +84,92 @@ async function ensureBudget() {
     throw new Error('syncId not found in .actualrc.json — cannot load budget');
   }
   
-  await logMessage(`Downloading budget ${rcConfig.syncId}...`);
+  try {
+    await logMessage(`Downloading budget ${rcConfig.syncId}...`);
+    await api.downloadBudget(rcConfig.syncId, {
+      password: rcConfig.encryptionPassword,
+    });
+    budgetLoaded = true;
+    await logMessage('Budget loaded');
+  } catch (err) {
+    if (isSqliteCorrupt(err)) {
+      await logMessage(`SQLite corruption during budget load: ${err.message}. Rebuilding...`);
+      await rebuildBudget();
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ───────────────────────────────────────────────────────────
+// SQLite Corruption Recovery
+// ───────────────────────────────────────────────────────────
+const RETRYABLE_SQLITE_PATTERNS = [
+  'SQLITE_CORRUPT',
+  'SQLITE_BUSY',
+  'SQLITE_IOERR',
+  'database disk image is malformed',
+  'database is locked',
+];
+
+function isSqliteCorrupt(err) {
+  if (!err) return false;
+  const msg = String(err.message || err);
+  const code = err.code || '';
+  return RETRYABLE_SQLITE_PATTERNS.some(p => msg.includes(p) || code.includes(p));
+}
+
+async function rebuildBudget() {
+  await logMessage('Rebuilding budget: shutting down API...');
+  
+  // Shut down the current API connection
+  if (api && apiInitialized) {
+    try { await api.shutdown(); } catch (e) { /* ignore */ }
+  }
+  apiInitialized = false;
+  budgetLoaded = false;
+  invalidateCache();
+  
+  // Delete local budget cache directories (mirrors actual-wrapper.sh reset)
+  const dataDir = rcConfig?.dataDir || path.join(os.homedir(), '.actual-data');
+  try {
+    const entries = await fs.readdir(dataDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const dirPath = path.join(dataDir, entry.name);
+      try {
+        await fs.access(path.join(dirPath, 'db.sqlite'));
+        // This directory contains a db.sqlite — it's a budget cache dir
+        await logMessage(`Removing corrupted budget cache: ${dirPath}`);
+        await fs.rm(dirPath, { recursive: true, force: true });
+      } catch (e) {
+        // No db.sqlite in this dir, skip
+      }
+    }
+  } catch (e) {
+    await logMessage(`Warning: could not scan dataDir ${dataDir}: ${e.message}`);
+  }
+  
+  // Re-initialize and re-download
+  await logMessage('Rebuilding budget: re-initializing API...');
+  api = await import('@actual-app/api');
+  const initOpts = {
+    serverURL: rcConfig.serverUrl,
+    dataDir,
+  };
+  if (rcConfig.password) {
+    initOpts.password = rcConfig.password;
+  }
+  await api.init(initOpts);
+  apiInitialized = true;
+  
+  await logMessage(`Rebuilding budget: downloading ${rcConfig.syncId}...`);
   await api.downloadBudget(rcConfig.syncId, {
     password: rcConfig.encryptionPassword,
   });
   budgetLoaded = true;
-  await logMessage('Budget loaded');
+  invalidateCache();
+  await logMessage('Budget rebuilt successfully');
 }
 
 // ───────────────────────────────────────────────────────────
@@ -1381,6 +1461,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: false,
     };
   } catch (err) {
+    // Retry once on SQLite corruption after rebuilding the budget
+    if (isSqliteCorrupt(err)) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await logMessage(`SQLite error detected: ${errMsg}. Rebuilding and retrying...`);
+      try {
+        await rebuildBudget();
+        const result = await executeCommand(cliArgs);
+        const output = formatOutput(result, format);
+        return {
+          content: [{ type: "text", text: output }],
+          isError: false,
+        };
+      } catch (retryErr) {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        await logMessage(`ERROR after rebuild retry: ${retryMsg}`);
+        return {
+          content: [{ type: "text", text: `Error (after rebuild retry): ${retryMsg}` }],
+          isError: true,
+        };
+      }
+    }
     const message = err instanceof Error ? err.message : String(err);
     await logMessage(`ERROR: ${message}`);
     return {
