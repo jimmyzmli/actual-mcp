@@ -1185,6 +1185,10 @@ async function handleServer(subCmd, opts) {
       const version = await api.getServerVersion();
       return { version };
     }
+    case 'info': {
+      // Return server and instance info
+      return { dataDir: INSTANCE_DATA_DIR };
+    }
     case 'get-id': {
       await ensureBudget();
       if (!opts.type) throw new Error('--type is required');
