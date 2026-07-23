@@ -2,6 +2,9 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
+import cors from "cors";
 import {
   CallToolRequestSchema, ListToolsRequestSchema,
   ListResourcesRequestSchema, ReadResourceRequestSchema,
@@ -1496,11 +1499,8 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
 
 let commandQueue = Promise.resolve();
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  let cliArgs = args.args || [];
+async function handleExecuteTool(name, cliArgsRaw) {
+  let cliArgs = cliArgsRaw || [];
 
   // Extract format from args (--format json|csv|table)
   let format = 'json';
@@ -1569,18 +1569,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   };
 
   const resultPromise = commandQueue.then(() => executeWithRetry());
-  // Ensure the queue continues even if a command throws internally (though executeWithRetry catches errors)
+  // Ensure the queue continues even if a command throws internally
   commandQueue = resultPromise.catch(() => {});
   return resultPromise;
+}
+
+// Handle tool calls
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+  return handleExecuteTool(name, args.args);
 });
 
 // ───────────────────────────────────────────────────────────
 // Startup
 // ───────────────────────────────────────────────────────────
 async function run() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error(`Actual Budget MCP server v2.0.0 running (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+  const args = parseArgs(process.argv.slice(2));
+
+  if (args.port) {
+    const port = parseIntFlag(args.port, "port");
+    const app = express();
+    app.use(cors());
+    app.use(express.json());
+
+    let sseTransport;
+
+    app.get("/sse", async (req, res) => {
+      sseTransport = new SSEServerTransport("/message", res);
+      await server.connect(sseTransport);
+    });
+
+    app.post("/message", async (req, res) => {
+      if (sseTransport) {
+        await sseTransport.handlePostMessage(req, res, req.body);
+      } else {
+        res.status(503).send("SSE transport not initialized. Connect to /sse first.");
+      }
+    });
+
+    app.post("/api/mcp/execute", async (req, res) => {
+      const { tool_name, arguments: argsObj } = req.body;
+      if (!tool_name) {
+        return res.status(400).json({ detail: "tool_name is required" });
+      }
+      try {
+        const result = await handleExecuteTool(tool_name, argsObj ? argsObj.args : []);
+        if (result.isError) {
+          return res.status(400).json({ detail: result.content[0].text });
+        }
+        return res.json({ stdout: result.content[0].text });
+      } catch (e) {
+        return res.status(500).json({ detail: e.message });
+      }
+    });
+
+    app.listen(port, () => {
+      console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (SSE/HTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+    });
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(`Actual Budget MCP server v2.0.0 running (stdio) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+  }
 }
 
 // Clean up instance data dir on graceful shutdown
@@ -1596,3 +1646,4 @@ process.on('SIGINT', () => { cleanupOnExit(); process.exit(0); });
 process.on('SIGTERM', () => { cleanupOnExit(); process.exit(0); });
 
 run().catch(console.error);
+setInterval(() => console.error('still alive'), 5000);
