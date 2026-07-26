@@ -61,6 +61,42 @@ cleanStalePidDirs();
 // ───────────────────────────────────────────────────────────
 // Logging
 // ───────────────────────────────────────────────────────────
+async function rotateLogIfNeeded(logPath, maxLines = 1000) {
+  try {
+    if (!fsSync.existsSync(logPath)) return;
+    const content = await fs.readFile(logPath, 'utf8');
+    let lineCount = 0;
+    for (let i = 0; i < content.length; i++) {
+      if (content[i] === '\n') lineCount++;
+    }
+    if (lineCount >= maxLines) {
+      const logDir = path.dirname(logPath);
+      const logFile = path.basename(logPath);
+      const files = await fs.readdir(logDir);
+      let maxIdx = 0;
+      for (const file of files) {
+        if (file.startsWith(logFile + '.')) {
+          const ext = file.substring(logFile.length + 1);
+          const num = parseInt(ext, 10);
+          if (!isNaN(num) && num > maxIdx) {
+            maxIdx = num;
+          }
+        }
+      }
+      for (let i = maxIdx; i >= 1; i--) {
+        const oldLog = `${logPath}.${i}`;
+        const newLog = `${logPath}.${i + 1}`;
+        if (fsSync.existsSync(oldLog)) {
+          await fs.rename(oldLog, newLog);
+        }
+      }
+      await fs.rename(logPath, `${logPath}.1`);
+    }
+  } catch (e) {
+    console.error(`Error rotating log: ${e.message}`);
+  }
+}
+
 async function logMessage(msg) {
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
   const line = `${timestamp} - ${msg}\n`;
@@ -68,6 +104,7 @@ async function logMessage(msg) {
     if (!fsSync.existsSync(LOG_DIR)) {
       await fs.mkdir(LOG_DIR, { recursive: true });
     }
+    await rotateLogIfNeeded(LOG_FILE);
     await fs.appendFile(LOG_FILE, line);
   } catch (e) {
     console.error(`Failed to write to log file: ${e.message}`);
