@@ -611,6 +611,7 @@ function buildQueryFromFile(parsed, fallbackTable) {
   if (typeof parsed.limit === 'number') queryObj = queryObj.limit(parsed.limit);
   if (typeof parsed.offset === 'number') queryObj = queryObj.offset(parsed.offset);
   if (Array.isArray(parsed.groupBy)) queryObj = queryObj.groupBy(parsed.groupBy);
+  if (isRecord(parsed.options)) queryObj = queryObj.options(parsed.options);
   return queryObj;
 }
 
