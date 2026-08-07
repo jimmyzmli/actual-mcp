@@ -1480,6 +1480,10 @@ async function handleExecuteTool(name, cliArgsRaw) {
             isError: false,
           };
         } catch (retryErr) {
+          if (isSqliteCorrupt(retryErr)) {
+            await logMessage(`FATAL: SQLite corruption persists after rebuild. Marking server as unhealthy.`);
+            isHealthy = false;
+          }
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           await logMessage(`ERROR after rebuild retry: ${retryMsg}`);
           return {
@@ -1539,7 +1543,16 @@ function createServer() {
     // Add the generic actual_execute tool
     tools.push({
       name: "actual_execute",
-      description: "Execute a generic command using the Actual Budget CLI. E.g., args: ['help'].",
+      description: `Execute a generic command using the Actual Budget CLI. E.g., args: ['help'].
+
+**Technical Lessons & Usage Notes**:
+- **Usage**: Do not run \`actual\` CLI commands directly via bash or python \`subprocess\`. Instead, always use the provided MCP tools and pass arguments via the \`args\` array parameter.
+- **Querying**: Always use \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\` in the \`args\` array for \`actual_query\`.
+- **Filtering Groups**: Filter by \`category.group.name\` using \`{"$oneof": [...]}\` for multi-group reports.
+- **Output**: Include \`--format\` and \`json\` in your tool \`args\` for reliable structured parsing.
+- **Split Transactions**: Default is \`inline\`. Use \`--file\` with \`{"options": {"splits": "grouped"}}\` for parent-child relationship visibility.
+- **Entity IDs**: Use \`actual_execute\` with \`args: ["server", "get-id", "--type", "<accounts|categories|category_groups>", "--name", "<Name>"]\` to find IDs for queries.
+- **Efficiency**: Use a single \`actual_query\` call (with \`args: ["run"]\`) to fetch 12 months of transactions for historical analysis. This reduces sync overhead and execution time by 10x compared to per-month API calls. Processing monthly totals and breakdowns in Python/scripts is near-instant.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1613,7 +1626,16 @@ function createServer() {
             role: "user",
             content: {
               type: "text",
-              text: "Please read the Actual Budget Skill Documentation resource at 'actual://skill-docs' to understand how to correctly query, format, and interact with the actual budget tools. Pay special attention to the advanced learnings, ActualQL querying, and transaction linking best practices."
+              text: `Please read the Actual Budget Skill Documentation resource at 'actual://skill-docs' to understand how to correctly query, format, and interact with the actual budget tools. Pay special attention to the advanced learnings, ActualQL querying, and transaction linking best practices.
+
+**Technical Lessons**:
+- **Usage**: Do not run \`actual\` CLI commands directly via bash or python \`subprocess\`. Instead, always use the provided MCP tools and pass arguments via the \`args\` array parameter.
+- **Querying**: Always use \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\` in the \`args\` array for \`actual_query\`.
+- **Filtering Groups**: Filter by \`category.group.name\` using \`{"$oneof": [...]}\` for multi-group reports.
+- **Output**: Include \`--format\` and \`json\` in your tool \`args\` for reliable structured parsing.
+- **Split Transactions**: Default is \`inline\`. Use \`--file\` with \`{"options": {"splits": "grouped"}}\` for parent-child relationship visibility.
+- **Entity IDs**: Use \`actual_execute\` with \`args: ["server", "get-id", "--type", "<accounts|categories|category_groups>", "--name", "<Name>"]\` to find IDs for queries.
+- **Efficiency**: Use a single \`actual_query\` call (with \`args: ["run"]\`) to fetch 12 months of transactions for historical analysis. This reduces sync overhead and execution time by 10x compared to per-month API calls. Processing monthly totals and breakdowns in Python/scripts is near-instant.`
             }
           }
         ]
@@ -1635,6 +1657,7 @@ function createServer() {
 // Startup
 // ───────────────────────────────────────────────────────────
 async function run() {
+  let isHealthy = true;
   const args = parseArgs(process.argv.slice(2));
 
   if (args.port) {
@@ -1645,6 +1668,15 @@ async function run() {
 
     // Per-session transport map — supports multiple concurrent clients
     const transports = new Map();
+
+    // ─── Health Check Endpoint ───
+    app.get("/health", (req, res) => {
+      if (isHealthy) {
+        res.status(200).json({ status: 'OK' });
+      } else {
+        res.status(503).json({ status: 'UNHEALTHY', error: 'Internal database corruption' });
+      }
+    });
 
     // ─── Streamable HTTP Transport (protocol version 2025-11-25) ───
     // Stateless mode — each POST is self-contained, no session to manage.
