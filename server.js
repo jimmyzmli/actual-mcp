@@ -2,7 +2,6 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
@@ -1647,39 +1646,6 @@ async function run() {
     // Per-session transport map — supports multiple concurrent clients
     const transports = new Map();
 
-    // ─── SSE Transport (protocol version 2024-11-05) ───
-    // Each SSE connection gets its own Server + Transport.
-    // The SSEServerTransport auto-generates a sessionId and tells the
-    // client to POST to /messages?sessionId=<id>.
-    app.get("/sse", async (req, res) => {
-      const transport = new SSEServerTransport("/messages", res);
-      const sessionId = transport.sessionId;
-      transports.set(sessionId, transport);
-      console.error(`[SSE] New session: ${sessionId} (${transports.size} active)`);
-
-      res.on('close', () => {
-        transports.delete(sessionId);
-        console.error(`[SSE] Session closed: ${sessionId} (${transports.size} active)`);
-      });
-
-      const server = createServer();
-      await server.connect(transport);
-    });
-
-    app.post("/messages", async (req, res) => {
-      const sessionId = req.query.sessionId;
-      const transport = transports.get(sessionId);
-      if (transport && transport instanceof SSEServerTransport) {
-        await transport.handlePostMessage(req, res, req.body);
-      } else {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'No active SSE session found for sessionId' },
-          id: null
-        });
-      }
-    });
-
     // ─── Streamable HTTP Transport (protocol version 2025-11-25) ───
     // Stateless mode — each POST is self-contained, no session to manage.
     app.all("/mcp", async (req, res) => {
@@ -1742,50 +1708,8 @@ async function run() {
       }
     });
 
-    // ─── Legacy backward-compatible POST /message (single-session, deprecated) ───
-    // Keep for any clients that might still POST to /message without sessionId
-    app.post("/message", async (req, res) => {
-      // Route to /messages — try to find the sessionId from query or use the last SSE session
-      const sessionId = req.query.sessionId;
-      if (sessionId) {
-        const transport = transports.get(sessionId);
-        if (transport && transport instanceof SSEServerTransport) {
-          await transport.handlePostMessage(req, res, req.body);
-          return;
-        }
-      }
-      // Fallback: try the most recent SSE transport (backward compat for single-client setups)
-      for (const [, transport] of transports) {
-        if (transport instanceof SSEServerTransport) {
-          await transport.handlePostMessage(req, res, req.body);
-          return;
-        }
-      }
-      res.status(503).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'No SSE transport available. Connect to /sse first.' },
-        id: null
-      });
-    });
-
-    app.post("/api/mcp/execute", async (req, res) => {
-      const { tool_name, arguments: argsObj } = req.body;
-      if (!tool_name) {
-        return res.status(400).json({ detail: "tool_name is required" });
-      }
-      try {
-        const result = await handleExecuteTool(tool_name, argsObj ? argsObj.args : []);
-        if (result.isError) {
-          return res.status(400).json({ detail: result.content[0].text });
-        }
-        return res.json({ stdout: result.content[0].text });
-      } catch (e) {
-        return res.status(500).json({ detail: e.message });
-      }
-    });
-
     app.listen(port, () => {
-      console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (SSE+StreamableHTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+      console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (StreamableHTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
     });
   } else {
     const server = createServer();
