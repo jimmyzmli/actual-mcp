@@ -3,6 +3,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import {
@@ -1421,120 +1424,9 @@ const COMMAND_SCHEMAS = {
 
 const CLI_COMMANDS = Object.keys(COMMAND_SCHEMAS);
 
-const server = new Server({
-  name: "actual-cli-mcp",
-  version: "2.0.0"
-}, {
-  capabilities: {
-    tools: {},
-    resources: {},
-    prompts: {}
-  }
-});
-
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const tools = Object.entries(COMMAND_SCHEMAS).map(([cmd, schema]) => ({
-    name: `actual_${cmd.replace(/-/g, '_')}`,
-    description: `Execute 'actual ${cmd}' command. ${schema.desc}\n\n${schema.details}\n\n${schema.rules}\n\nGlobal flags like --format json, --verbose are also supported. Amounts are in integer cents (e.g. 5000 = $50.00).`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        args: {
-          type: "array",
-          items: { type: "string" },
-          description: `The list of arguments/flags to pass to 'actual ${cmd}'. E.g., ["list", "--format", "json"] or ["create", "--name", "My Account"]`
-        }
-      },
-      required: ["args"]
-    }
-  }));
-
-  // Add the generic actual_execute tool
-  tools.push({
-    name: "actual_execute",
-    description: "Execute a generic command using the Actual Budget CLI. E.g., args: ['help'].",
-    inputSchema: {
-      type: "object",
-      properties: {
-        args: {
-          type: "array",
-          items: { type: "string" },
-          description: "The list of arguments to pass to the CLI. Do not include the 'actual' executable name."
-        }
-      },
-      required: ["args"]
-    }
-  });
-
-  return { tools };
-});
-
-// Expose SKILL.md as an MCP Resource
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  return {
-    resources: [
-      {
-        uri: "actual://skill-docs",
-        name: "Actual Budget Skill Documentation",
-        description: "Comprehensive guide, CLI reference, and best practices for interacting with the Actual Budget API.",
-        mimeType: "text/markdown"
-      }
-    ]
-  };
-});
-
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const uri = request.params.uri;
-  if (uri === "actual://skill-docs") {
-    const skillPath = '~/.gemini/antigravity/skills/actual/SKILL.md';
-    try {
-      const content = await fs.readFile(skillPath, 'utf8');
-      return {
-        contents: [
-          {
-            uri: "actual://skill-docs",
-            mimeType: "text/markdown",
-            text: content
-          }
-        ]
-      };
-    } catch (e) {
-      throw new Error(`Failed to read SKILL.md: ${e.message}`);
-    }
-  }
-  throw new Error(`Unknown resource: ${uri}`);
-});
-
-// Expose Prompts to instruct agents
-server.setRequestHandler(ListPromptsRequestSchema, async () => {
-  return {
-    prompts: [
-      {
-        name: "actual_budget_guidelines",
-        description: "Get instructions and best practices for interacting with Actual Budget.",
-      }
-    ]
-  };
-});
-
-server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-  if (request.params.name === "actual_budget_guidelines") {
-    return {
-      description: "Actual Budget Integration Guidelines",
-      messages: [
-        {
-          role: "user",
-          content: {
-            type: "text",
-            text: "Please read the Actual Budget Skill Documentation resource at 'actual://skill-docs' to understand how to correctly query, format, and interact with the actual budget tools. Pay special attention to the advanced learnings, ActualQL querying, and transaction linking best practices."
-          }
-        }
-      ]
-    };
-  }
-  throw new Error(`Unknown prompt: ${request.params.name}`);
-});
-
+// ───────────────────────────────────────────────────────────
+// Shared command queue and tool executor (used by all sessions)
+// ───────────────────────────────────────────────────────────
 let commandQueue = Promise.resolve();
 
 async function handleExecuteTool(name, cliArgsRaw) {
@@ -1612,11 +1504,133 @@ async function handleExecuteTool(name, cliArgsRaw) {
   return resultPromise;
 }
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  return handleExecuteTool(name, args.args);
-});
+// ───────────────────────────────────────────────────────────
+// MCP Server Factory — creates a new Server instance per session
+// All sessions share the same API connection, cache, and command queue
+// ───────────────────────────────────────────────────────────
+function createServer() {
+  const server = new Server({
+    name: "actual-cli-mcp",
+    version: "2.0.0"
+  }, {
+    capabilities: {
+      tools: {},
+      resources: {},
+      prompts: {}
+    }
+  });
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const tools = Object.entries(COMMAND_SCHEMAS).map(([cmd, schema]) => ({
+      name: `actual_${cmd.replace(/-/g, '_')}`,
+      description: `Execute 'actual ${cmd}' command. ${schema.desc}\n\n${schema.details}\n\n${schema.rules}\n\nGlobal flags like --format json, --verbose are also supported. Amounts are in integer cents (e.g. 5000 = $50.00).`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          args: {
+            type: "array",
+            items: { type: "string" },
+            description: `The list of arguments/flags to pass to 'actual ${cmd}'. E.g., ["list", "--format", "json"] or ["create", "--name", "My Account"]`
+          }
+        },
+        required: ["args"]
+      }
+    }));
+
+    // Add the generic actual_execute tool
+    tools.push({
+      name: "actual_execute",
+      description: "Execute a generic command using the Actual Budget CLI. E.g., args: ['help'].",
+      inputSchema: {
+        type: "object",
+        properties: {
+          args: {
+            type: "array",
+            items: { type: "string" },
+            description: "The list of arguments to pass to the CLI. Do not include the 'actual' executable name."
+          }
+        },
+        required: ["args"]
+      }
+    });
+
+    return { tools };
+  });
+
+  // Expose SKILL.md as an MCP Resource
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    return {
+      resources: [
+        {
+          uri: "actual://skill-docs",
+          name: "Actual Budget Skill Documentation",
+          description: "Comprehensive guide, CLI reference, and best practices for interacting with the Actual Budget API.",
+          mimeType: "text/markdown"
+        }
+      ]
+    };
+  });
+
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const uri = request.params.uri;
+    if (uri === "actual://skill-docs") {
+      const skillPath = '~/.gemini/antigravity/skills/actual/SKILL.md';
+      try {
+        const content = await fs.readFile(skillPath, 'utf8');
+        return {
+          contents: [
+            {
+              uri: "actual://skill-docs",
+              mimeType: "text/markdown",
+              text: content
+            }
+          ]
+        };
+      } catch (e) {
+        throw new Error(`Failed to read SKILL.md: ${e.message}`);
+      }
+    }
+    throw new Error(`Unknown resource: ${uri}`);
+  });
+
+  // Expose Prompts to instruct agents
+  server.setRequestHandler(ListPromptsRequestSchema, async () => {
+    return {
+      prompts: [
+        {
+          name: "actual_budget_guidelines",
+          description: "Get instructions and best practices for interacting with Actual Budget.",
+        }
+      ]
+    };
+  });
+
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    if (request.params.name === "actual_budget_guidelines") {
+      return {
+        description: "Actual Budget Integration Guidelines",
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: "Please read the Actual Budget Skill Documentation resource at 'actual://skill-docs' to understand how to correctly query, format, and interact with the actual budget tools. Pay special attention to the advanced learnings, ActualQL querying, and transaction linking best practices."
+            }
+          }
+        ]
+      };
+    }
+    throw new Error(`Unknown prompt: ${request.params.name}`);
+  });
+
+  // Handle tool calls
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    return handleExecuteTool(name, args.args);
+  });
+
+  return server;
+}
 
 // ───────────────────────────────────────────────────────────
 // Startup
@@ -1630,19 +1644,128 @@ async function run() {
     app.use(cors());
     app.use(express.json());
 
-    let sseTransport;
+    // Per-session transport map — supports multiple concurrent clients
+    const transports = new Map();
 
+    // ─── SSE Transport (protocol version 2024-11-05) ───
+    // Each SSE connection gets its own Server + Transport.
+    // The SSEServerTransport auto-generates a sessionId and tells the
+    // client to POST to /messages?sessionId=<id>.
     app.get("/sse", async (req, res) => {
-      sseTransport = new SSEServerTransport("/message", res);
-      await server.connect(sseTransport);
+      const transport = new SSEServerTransport("/messages", res);
+      const sessionId = transport.sessionId;
+      transports.set(sessionId, transport);
+      console.error(`[SSE] New session: ${sessionId} (${transports.size} active)`);
+
+      res.on('close', () => {
+        transports.delete(sessionId);
+        console.error(`[SSE] Session closed: ${sessionId} (${transports.size} active)`);
+      });
+
+      const server = createServer();
+      await server.connect(transport);
     });
 
-    app.post("/message", async (req, res) => {
-      if (sseTransport) {
-        await sseTransport.handlePostMessage(req, res, req.body);
+    app.post("/messages", async (req, res) => {
+      const sessionId = req.query.sessionId;
+      const transport = transports.get(sessionId);
+      if (transport && transport instanceof SSEServerTransport) {
+        await transport.handlePostMessage(req, res, req.body);
       } else {
-        res.status(503).send("SSE transport not initialized. Connect to /sse first.");
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'No active SSE session found for sessionId' },
+          id: null
+        });
       }
+    });
+
+    // ─── Streamable HTTP Transport (protocol version 2025-11-25) ───
+    // Stateless mode — each POST is self-contained, no session to manage.
+    app.all("/mcp", async (req, res) => {
+      try {
+        // Check for existing session
+        const sessionId = req.headers['mcp-session-id'];
+        let transport;
+
+        if (sessionId && transports.has(sessionId)) {
+          const existing = transports.get(sessionId);
+          if (existing instanceof StreamableHTTPServerTransport) {
+            transport = existing;
+          } else {
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: 'Session exists but uses a different transport protocol' },
+              id: null
+            });
+            return;
+          }
+        } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
+          // New Streamable HTTP session
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid) => {
+              transports.set(sid, transport);
+              console.error(`[StreamableHTTP] New session: ${sid} (${transports.size} active)`);
+            }
+          });
+
+          transport.onclose = () => {
+            const sid = transport.sessionId;
+            if (sid && transports.has(sid)) {
+              transports.delete(sid);
+              console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
+            }
+          };
+
+          const server = createServer();
+          await server.connect(transport);
+        } else {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: null
+          });
+          return;
+        }
+
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        console.error('Error handling Streamable HTTP request:', error);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: null
+          });
+        }
+      }
+    });
+
+    // ─── Legacy backward-compatible POST /message (single-session, deprecated) ───
+    // Keep for any clients that might still POST to /message without sessionId
+    app.post("/message", async (req, res) => {
+      // Route to /messages — try to find the sessionId from query or use the last SSE session
+      const sessionId = req.query.sessionId;
+      if (sessionId) {
+        const transport = transports.get(sessionId);
+        if (transport && transport instanceof SSEServerTransport) {
+          await transport.handlePostMessage(req, res, req.body);
+          return;
+        }
+      }
+      // Fallback: try the most recent SSE transport (backward compat for single-client setups)
+      for (const [, transport] of transports) {
+        if (transport instanceof SSEServerTransport) {
+          await transport.handlePostMessage(req, res, req.body);
+          return;
+        }
+      }
+      res.status(503).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'No SSE transport available. Connect to /sse first.' },
+        id: null
+      });
     });
 
     app.post("/api/mcp/execute", async (req, res) => {
@@ -1662,9 +1785,10 @@ async function run() {
     });
 
     app.listen(port, () => {
-      console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (SSE/HTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+      console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (SSE+StreamableHTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
     });
   } else {
+    const server = createServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error(`Actual Budget MCP server v2.0.0 running (stdio) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
