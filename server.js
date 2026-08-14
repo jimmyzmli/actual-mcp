@@ -1458,6 +1458,14 @@ async function handleExecuteTool(name, cliArgsRaw) {
     throw new Error(`Unknown tool: ${name}`);
   }
 
+  const extractError = (e) => {
+    if (e instanceof Error) return e.stack || e.message;
+    if (typeof e === 'object' && e !== null) {
+      try { return JSON.stringify(e); } catch { return String(e); }
+    }
+    return String(e);
+  };
+
   const executeWithRetry = async () => {
     try {
       const result = await executeCommand(cliArgs);
@@ -1469,7 +1477,7 @@ async function handleExecuteTool(name, cliArgsRaw) {
     } catch (err) {
       // Retry once on SQLite corruption after rebuilding the budget
       if (isSqliteCorrupt(err)) {
-        const errMsg = err instanceof Error ? err.message : String(err);
+        const errMsg = extractError(err);
         await logMessage(`SQLite error detected: ${errMsg}. Rebuilding and retrying...`);
         try {
           await rebuildBudget();
@@ -1484,7 +1492,7 @@ async function handleExecuteTool(name, cliArgsRaw) {
             await logMessage(`FATAL: SQLite corruption persists after rebuild. Marking server as unhealthy.`);
             isHealthy = false;
           }
-          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          const retryMsg = extractError(retryErr);
           await logMessage(`ERROR after rebuild retry: ${retryMsg}`);
           return {
             content: [{ type: "text", text: `Error (after rebuild retry): ${retryMsg}` }],
@@ -1492,7 +1500,7 @@ async function handleExecuteTool(name, cliArgsRaw) {
           };
         }
       }
-      const message = err instanceof Error ? err.message : String(err);
+      const message = extractError(err);
       await logMessage(`ERROR: ${message}`);
       return {
         content: [{ type: "text", text: `Error: ${message}` }],
