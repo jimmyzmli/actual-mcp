@@ -797,6 +797,22 @@ async function handleTransactions(subCmd, opts) {
       const id = opts._positional[0];
       if (!id) throw new Error('Transaction ID is required');
       const fields = readJsonInput(opts);
+
+      if (fields.payee_name) {
+        if (!cache.payees) {
+          cache.payees = await api.getPayees();
+        }
+        let payeeObj = cache.payees.find(p => p.name.toLowerCase() === fields.payee_name.toLowerCase());
+        if (payeeObj) {
+          fields.payee = payeeObj.id;
+        } else {
+          const newId = await api.createPayee({ name: fields.payee_name });
+          fields.payee = newId;
+          cache.payees = null; // Invalidate cache
+        }
+        delete fields.payee_name;
+      }
+
       await api.updateTransaction(id, fields);
       return { success: true, id };
     }
