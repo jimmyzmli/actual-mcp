@@ -1463,12 +1463,1133 @@ const COMMAND_SCHEMAS = {
 const CLI_COMMANDS = Object.keys(COMMAND_SCHEMAS);
 
 // ───────────────────────────────────────────────────────────
+// Granular Tool Definitions (Explicit Read-Only vs. Mutating)
+// ───────────────────────────────────────────────────────────
+
+export const MCP_TOOL_DEFINITIONS = [
+  // ─── READ-ONLY TOOLS (Auto-approved for Gemini Spark) ───
+  {
+    name: "actual_query",
+    readOnly: true,
+    description: `[READ-ONLY] Run an ActualQL query against budget data (e.g., transactions, accounts, categories, payees). Does not modify data.
+
+**Querying Best Practices**:
+- **Select Fields**: Use --select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget".
+- **Filter Syntax**: Use ActualQL JSON filter object, e.g. {"amount": {"$lt": 0}} or {"category.group.name": {"$oneof": ["Food", "Bills"]}}.
+- **Historical Analysis**: Run a single query to fetch transactions rather than multiple per-month API calls.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        table: { type: "string", description: "Target table (e.g. transactions, accounts, categories, payees)" },
+        select: { type: "string", description: "Comma-separated field list (e.g. 'date,amount,payee.name,notes,category.name')" },
+        filter: { type: ["object", "string"], description: "ActualQL filter object or JSON string" },
+        order_by: { type: "string", description: "Sort fields" },
+        limit: { type: "integer", description: "Maximum rows" },
+        count: { type: "boolean", description: "Return count only" },
+        data: { type: ["object", "string"], description: "Custom query JSON object or string" },
+        file: { type: "string", description: "Path to query JSON file" },
+        args: { type: "array", items: { type: "string" }, description: "Legacy CLI argument list" }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) {
+        return ["query", ...(input.args[0] === "run" || input.args[0] === "tables" || input.args[0] === "fields" ? [] : ["run"]), ...input.args];
+      }
+      const cli = ["query", "run"];
+      if (input.table) cli.push("--table", input.table);
+      if (input.select) cli.push("--select", input.select);
+      if (input.filter) cli.push("--filter", typeof input.filter === "object" ? JSON.stringify(input.filter) : input.filter);
+      if (input.order_by || input["order-by"]) cli.push("--order-by", input.order_by || input["order-by"]);
+      if (input.limit !== undefined) cli.push("--limit", String(input.limit));
+      if (input.count) cli.push("--count");
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      return cli;
+    }
+  },
+  {
+    name: "actual_query_tables",
+    readOnly: true,
+    description: "[READ-ONLY] List all available ActualQL tables in the budget schema.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["query", "tables", ...(input.args || [])]
+  },
+  {
+    name: "actual_query_fields",
+    readOnly: true,
+    description: "[READ-ONLY] Get field definitions and schema for a specific ActualQL table.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        table: { type: "string", description: "Table name (e.g. transactions, accounts)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["table"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["query", "fields", ...input.args];
+      return ["query", "fields", input.table];
+    }
+  },
+  {
+    name: "actual_list_accounts",
+    readOnly: true,
+    description: "[READ-ONLY] List all budget and off-budget accounts, including IDs, names, closed status, and current balances in cents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_closed: { type: "boolean", description: "Include closed accounts (default: false)" },
+        format: { type: "string", enum: ["json", "table", "csv"], description: "Output format" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "list", ...input.args];
+      const cli = ["accounts", "list"];
+      if (input.include_closed || input["include-closed"]) cli.push("--include-closed");
+      if (input.format) cli.push("--format", input.format);
+      return cli;
+    }
+  },
+  {
+    name: "actual_get_account_balance",
+    readOnly: true,
+    description: "[READ-ONLY] Get the current or historical balance for an account by ID (in integer cents).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account UUID" },
+        cutoff: { type: "string", description: "Optional cutoff date (YYYY-MM-DD)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "balance", ...input.args];
+      const cli = ["accounts", "balance", input.id];
+      if (input.cutoff) cli.push("--cutoff", input.cutoff);
+      return cli;
+    }
+  },
+  {
+    name: "actual_list_budgets",
+    readOnly: true,
+    description: "[READ-ONLY] List all budgets available on the Actual server.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["budgets", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_list_budget_months",
+    readOnly: true,
+    description: "[READ-ONLY] List all available budget months.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["budgets", "months", ...(input.args || [])]
+  },
+  {
+    name: "actual_get_budget_month",
+    readOnly: true,
+    description: "[READ-ONLY] Get budget allocations and summary for a specific month (YYYY-MM).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Month formatted as YYYY-MM" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["month"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "month", ...input.args];
+      return ["budgets", "month", input.month];
+    }
+  },
+  {
+    name: "actual_list_transactions",
+    readOnly: true,
+    description: "[READ-ONLY] List transactions for a specific account within a date range.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account: { type: "string", description: "Account UUID" },
+        start: { type: "string", description: "Start date (YYYY-MM-DD)" },
+        end: { type: "string", description: "End date (YYYY-MM-DD)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["account", "start", "end"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "list", ...input.args];
+      const cli = ["transactions", "list"];
+      if (input.account) cli.push("--account", input.account);
+      if (input.start) cli.push("--start", input.start);
+      if (input.end) cli.push("--end", input.end);
+      return cli;
+    }
+  },
+  {
+    name: "actual_list_categories",
+    readOnly: true,
+    description: "[READ-ONLY] List all budget categories with IDs, names, group IDs, and hidden status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_hidden: { type: "boolean", description: "Include hidden categories" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["categories", "list", ...input.args];
+      const cli = ["categories", "list"];
+      if (input.include_hidden || input["include-hidden"]) cli.push("--include-hidden");
+      return cli;
+    }
+  },
+  {
+    name: "actual_list_category_groups",
+    readOnly: true,
+    description: "[READ-ONLY] List all category groups with nested categories.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_hidden: { type: "boolean", description: "Include hidden category groups" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["category-groups", "list", ...input.args];
+      const cli = ["category-groups", "list"];
+      if (input.include_hidden || input["include-hidden"]) cli.push("--include-hidden");
+      return cli;
+    }
+  },
+  {
+    name: "actual_list_payees",
+    readOnly: true,
+    description: "[READ-ONLY] List all payees in the budget.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["payees", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_get_common_payees",
+    readOnly: true,
+    description: "[READ-ONLY] List frequently used payees.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["payees", "common", ...(input.args || [])]
+  },
+  {
+    name: "actual_list_tags",
+    readOnly: true,
+    description: "[READ-ONLY] List all transaction tags.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["tags", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_list_rules",
+    readOnly: true,
+    description: "[READ-ONLY] List all transaction rules.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["rules", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_get_payee_rules",
+    readOnly: true,
+    description: "[READ-ONLY] Get transaction rules associated with a specific payee ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        payee_id: { type: "string", description: "Payee UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["payee_id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["rules", "payee-rules", ...input.args];
+      return ["rules", "payee-rules", input.payee_id || input.id];
+    }
+  },
+  {
+    name: "actual_list_schedules",
+    readOnly: true,
+    description: "[READ-ONLY] List all scheduled transactions and recurring rules.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["schedules", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_get_server_version",
+    readOnly: true,
+    description: "[READ-ONLY] Get the Actual Budget server version.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["server", "version", ...(input.args || [])]
+  },
+  {
+    name: "actual_get_id",
+    readOnly: true,
+    description: "[READ-ONLY] Look up an entity UUID by its type ('accounts', 'categories', 'category_groups', 'payees') and name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: { type: "string", description: "Entity type ('accounts', 'categories', 'category_groups', 'payees')" },
+        name: { type: "string", description: "Exact name to look up" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["type", "name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["server", "get-id", ...input.args];
+      return ["server", "get-id", "--type", input.type, "--name", input.name];
+    }
+  },
+  {
+    name: "actual_get_sync_status",
+    readOnly: true,
+    description: "[READ-ONLY] Check budget connection and cache status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["sync", "--status", ...(input.args || [])]
+  },
+
+  // ─── MUTATING TOOLS ───
+  {
+    name: "actual_create_account",
+    readOnly: false,
+    description: "[MUTATING] Create a new account in Actual Budget.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Account name" },
+        offbudget: { type: "boolean", description: "Whether account is offbudget (default: false)" },
+        balance: { type: "integer", description: "Starting balance in cents (default: 0)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "create", ...input.args];
+      const cli = ["accounts", "create", "--name", input.name];
+      if (input.offbudget) cli.push("--offbudget");
+      if (input.balance !== undefined) cli.push("--balance", String(input.balance));
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_account",
+    readOnly: false,
+    description: "[MUTATING] Update an existing account's name or offbudget status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account UUID" },
+        name: { type: "string", description: "New account name" },
+        offbudget: { type: "boolean", description: "New offbudget status" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "update", ...input.args];
+      const cli = ["accounts", "update", input.id];
+      if (input.name !== undefined) cli.push("--name", input.name);
+      if (input.offbudget !== undefined) cli.push("--offbudget", String(input.offbudget));
+      return cli;
+    }
+  },
+  {
+    name: "actual_close_account",
+    readOnly: false,
+    description: "[MUTATING] Close an account with optional transfer account/category.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account UUID" },
+        transfer_account: { type: "string", description: "Optional transfer account ID" },
+        transfer_category: { type: "string", description: "Optional transfer category ID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "close", ...input.args];
+      const cli = ["accounts", "close", input.id];
+      if (input.transfer_account || input["transfer-account"]) cli.push("--transfer-account", input.transfer_account || input["transfer-account"]);
+      if (input.transfer_category || input["transfer-category"]) cli.push("--transfer-category", input.transfer_category || input["transfer-category"]);
+      return cli;
+    }
+  },
+  {
+    name: "actual_reopen_account",
+    readOnly: false,
+    description: "[MUTATING] Reopen a closed account.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "reopen", ...input.args];
+      return ["accounts", "reopen", input.id];
+    }
+  },
+  {
+    name: "actual_delete_account",
+    readOnly: false,
+    description: "[MUTATING] Permanently delete an account.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["accounts", "delete", ...input.args];
+      return ["accounts", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_download_budget",
+    readOnly: false,
+    description: "[MUTATING] Download and load a budget by syncId.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sync_id: { type: "string", description: "Budget syncId" },
+        encryption_password: { type: "string", description: "Optional encryption password" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["sync_id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "download", ...input.args];
+      const cli = ["budgets", "download", input.sync_id || input.syncId];
+      if (input.encryption_password || input["encryption-password"]) cli.push("--encryption-password", input.encryption_password || input["encryption-password"]);
+      return cli;
+    }
+  },
+  {
+    name: "actual_set_budget_amount",
+    readOnly: false,
+    description: "[MUTATING] Set the budgeted amount for a category in a specific month.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Month formatted as YYYY-MM" },
+        category: { type: "string", description: "Category UUID" },
+        amount: { type: "integer", description: "Budget amount in integer cents" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["month", "category", "amount"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "set-amount", ...input.args];
+      return ["budgets", "set-amount", "--month", input.month, "--category", input.category, "--amount", String(input.amount)];
+    }
+  },
+  {
+    name: "actual_set_budget_carryover",
+    readOnly: false,
+    description: "[MUTATING] Toggle carryover flag for a category in a specific month.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Month formatted as YYYY-MM" },
+        category: { type: "string", description: "Category UUID" },
+        flag: { type: "boolean", description: "Carryover boolean flag" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["month", "category", "flag"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "set-carryover", ...input.args];
+      return ["budgets", "set-carryover", "--month", input.month, "--category", input.category, "--flag", String(input.flag)];
+    }
+  },
+  {
+    name: "actual_hold_budget_next_month",
+    readOnly: false,
+    description: "[MUTATING] Hold a specific amount from the current month's budget for next month.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Month formatted as YYYY-MM" },
+        amount: { type: "integer", description: "Amount in integer cents" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["month", "amount"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "hold-next-month", ...input.args];
+      return ["budgets", "hold-next-month", "--month", input.month, "--amount", String(input.amount)];
+    }
+  },
+  {
+    name: "actual_reset_budget_hold",
+    readOnly: false,
+    description: "[MUTATING] Reset the budget hold amount for a specific month.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        month: { type: "string", description: "Month formatted as YYYY-MM" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["month"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "reset-hold", ...input.args];
+      return ["budgets", "reset-hold", "--month", input.month];
+    }
+  },
+  {
+    name: "actual_add_transactions",
+    readOnly: false,
+    description: "[MUTATING] Add one or more new transactions to an account.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account: { type: "string", description: "Account UUID" },
+        data: { type: ["array", "object", "string"], description: "Transaction object, array of transactions, or JSON string" },
+        file: { type: "string", description: "Path to JSON file containing transactions" },
+        learn_categories: { type: "boolean", description: "Automatically learn payee categories" },
+        run_transfers: { type: "boolean", description: "Automatically resolve transfers" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["account"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "add", ...input.args];
+      const cli = ["transactions", "add", "--account", input.account];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      if (input.learn_categories || input["learn-categories"]) cli.push("--learn-categories");
+      if (input.run_transfers || input["run-transfers"]) cli.push("--run-transfers");
+      return cli;
+    }
+  },
+  {
+    name: "actual_import_transactions",
+    readOnly: false,
+    description: "[MUTATING] Import transactions with deduplication and default cleared status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account: { type: "string", description: "Account UUID" },
+        data: { type: ["array", "object", "string"], description: "Transaction array or JSON string" },
+        file: { type: "string", description: "Path to transactions JSON file" },
+        dry_run: { type: "boolean", description: "Perform dry run without saving" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["account"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "import", ...input.args];
+      const cli = ["transactions", "import", "--account", input.account];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      if (input.dry_run || input["dry-run"]) cli.push("--dry-run");
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_transaction",
+    readOnly: false,
+    description: "[MUTATING] Update fields of an existing transaction by ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Transaction UUID" },
+        data: { type: ["object", "string"], description: "JSON object or string with fields to update (e.g. notes, payee, category, amount, date)" },
+        file: { type: "string", description: "Path to JSON file with update fields" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "update", ...input.args];
+      const cli = ["transactions", "update", input.id];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_transaction",
+    readOnly: false,
+    description: "[MUTATING] Delete a transaction by ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Transaction UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "delete", ...input.args];
+      return ["transactions", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_restore_transaction_notes",
+    readOnly: false,
+    description: "[MUTATING] Restore transaction notes for specified transaction IDs from backup.sqlite.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: ["array", "string"], description: "List of transaction IDs or comma-separated string" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "restore-notes", ...input.args];
+      const ids = Array.isArray(input.ids) ? input.ids : (input.ids ? String(input.ids).split(",") : []);
+      return ["transactions", "restore-notes", ...ids];
+    }
+  },
+  {
+    name: "actual_restore_transactions",
+    readOnly: false,
+    description: "[MUTATING] Restore entire transaction records for specified IDs from backup.sqlite.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: ["array", "string"], description: "List of transaction IDs or comma-separated string" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "restore-transaction", ...input.args];
+      const ids = Array.isArray(input.ids) ? input.ids : (input.ids ? String(input.ids).split(",") : []);
+      return ["transactions", "restore-transaction", ...ids];
+    }
+  },
+  {
+    name: "actual_create_category",
+    readOnly: false,
+    description: "[MUTATING] Create a new category.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Category name" },
+        group_id: { type: "string", description: "Parent category group UUID" },
+        is_income: { type: "boolean", description: "Whether category is income (default: false)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["name", "group_id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["categories", "create", ...input.args];
+      const cli = ["categories", "create", "--name", input.name, "--group-id", input.group_id || input["group-id"]];
+      if (input.is_income || input["is-income"]) cli.push("--is-income");
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_category",
+    readOnly: false,
+    description: "[MUTATING] Update a category's name or hidden status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Category UUID" },
+        name: { type: "string", description: "New category name" },
+        hidden: { type: "boolean", description: "Hidden flag" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["categories", "update", ...input.args];
+      const cli = ["categories", "update", input.id];
+      if (input.name !== undefined) cli.push("--name", input.name);
+      if (input.hidden !== undefined) cli.push("--hidden", String(input.hidden));
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_category",
+    readOnly: false,
+    description: "[MUTATING] Delete a category with optional category transfer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Category UUID" },
+        transfer_to: { type: "string", description: "Optional category ID to transfer transactions to" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["categories", "delete", ...input.args];
+      const cli = ["categories", "delete", input.id];
+      if (input.transfer_to || input["transfer-to"]) cli.push("--transfer-to", input.transfer_to || input["transfer-to"]);
+      return cli;
+    }
+  },
+  {
+    name: "actual_create_category_group",
+    readOnly: false,
+    description: "[MUTATING] Create a new category group.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Category group name" },
+        is_income: { type: "boolean", description: "Whether group is income (default: false)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["category-groups", "create", ...input.args];
+      const cli = ["category-groups", "create", "--name", input.name];
+      if (input.is_income || input["is-income"]) cli.push("--is-income");
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_category_group",
+    readOnly: false,
+    description: "[MUTATING] Update a category group's name or hidden status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Category group UUID" },
+        name: { type: "string", description: "New name" },
+        hidden: { type: "boolean", description: "Hidden flag" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["category-groups", "update", ...input.args];
+      const cli = ["category-groups", "update", input.id];
+      if (input.name !== undefined) cli.push("--name", input.name);
+      if (input.hidden !== undefined) cli.push("--hidden", String(input.hidden));
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_category_group",
+    readOnly: false,
+    description: "[MUTATING] Delete a category group with optional category group transfer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Category group UUID" },
+        transfer_to: { type: "string", description: "Optional category group ID to transfer to" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["category-groups", "delete", ...input.args];
+      const cli = ["category-groups", "delete", input.id];
+      if (input.transfer_to || input["transfer-to"]) cli.push("--transfer-to", input.transfer_to || input["transfer-to"]);
+      return cli;
+    }
+  },
+  {
+    name: "actual_create_payee",
+    readOnly: false,
+    description: "[MUTATING] Create a new payee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Payee name" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "create", ...input.args];
+      return ["payees", "create", "--name", input.name];
+    }
+  },
+  {
+    name: "actual_update_payee",
+    readOnly: false,
+    description: "[MUTATING] Update a payee name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Payee UUID" },
+        name: { type: "string", description: "New name" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id", "name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "update", ...input.args];
+      return ["payees", "update", input.id, "--name", input.name];
+    }
+  },
+  {
+    name: "actual_delete_payee",
+    readOnly: false,
+    description: "[MUTATING] Delete a payee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Payee UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "delete", ...input.args];
+      return ["payees", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_merge_payees",
+    readOnly: false,
+    description: "[MUTATING] Merge multiple payees into a single target payee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "Target payee UUID" },
+        ids: { type: ["array", "string"], description: "List of payee IDs or comma-separated string to merge" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["target", "ids"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "merge", ...input.args];
+      const ids = Array.isArray(input.ids) ? input.ids.join(",") : input.ids;
+      return ["payees", "merge", "--target", input.target, "--ids", ids];
+    }
+  },
+  {
+    name: "actual_create_tag",
+    readOnly: false,
+    description: "[MUTATING] Create a new tag.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tag: { type: "string", description: "Tag name" },
+        color: { type: "string", description: "Optional color hex/name" },
+        description: { type: "string", description: "Optional description" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["tag"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["tags", "create", ...input.args];
+      const cli = ["tags", "create", "--tag", input.tag];
+      if (input.color) cli.push("--color", input.color);
+      if (input.description) cli.push("--description", input.description);
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_tag",
+    readOnly: false,
+    description: "[MUTATING] Update a tag.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Tag UUID" },
+        tag: { type: "string", description: "New tag name" },
+        color: { type: "string", description: "New color" },
+        description: { type: "string", description: "New description" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["tags", "update", ...input.args];
+      const cli = ["tags", "update", input.id];
+      if (input.tag !== undefined) cli.push("--tag", input.tag);
+      if (input.color !== undefined) cli.push("--color", input.color);
+      if (input.description !== undefined) cli.push("--description", input.description);
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_tag",
+    readOnly: false,
+    description: "[MUTATING] Delete a tag.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Tag UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["tags", "delete", ...input.args];
+      return ["tags", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_create_rule",
+    readOnly: false,
+    description: "[MUTATING] Create a new transaction rule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        data: { type: ["object", "string"], description: "Rule JSON object or string" },
+        file: { type: "string", description: "Path to rule JSON file" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["rules", "create", ...input.args];
+      const cli = ["rules", "create"];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_rule",
+    readOnly: false,
+    description: "[MUTATING] Update a transaction rule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        data: { type: ["object", "string"], description: "Rule JSON object (must include 'id') or string" },
+        file: { type: "string", description: "Path to rule JSON file" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["rules", "update", ...input.args];
+      const cli = ["rules", "update"];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_rule",
+    readOnly: false,
+    description: "[MUTATING] Delete a transaction rule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Rule UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["rules", "delete", ...input.args];
+      return ["rules", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_create_schedule",
+    readOnly: false,
+    description: "[MUTATING] Create a scheduled transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        data: { type: ["object", "string"], description: "Schedule JSON object or string" },
+        file: { type: "string", description: "Path to schedule JSON file" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["schedules", "create", ...input.args];
+      const cli = ["schedules", "create"];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      return cli;
+    }
+  },
+  {
+    name: "actual_update_schedule",
+    readOnly: false,
+    description: "[MUTATING] Update a scheduled transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Schedule UUID" },
+        data: { type: ["object", "string"], description: "Schedule JSON object or string" },
+        file: { type: "string", description: "Path to schedule JSON file" },
+        reset_next_date: { type: "boolean", description: "Reset the next scheduled date" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["schedules", "update", ...input.args];
+      const cli = ["schedules", "update", input.id];
+      if (input.data) cli.push("--data", typeof input.data === "object" ? JSON.stringify(input.data) : input.data);
+      if (input.file) cli.push("--file", input.file);
+      if (input.reset_next_date || input["reset-next-date"]) cli.push("--reset-next-date");
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_schedule",
+    readOnly: false,
+    description: "[MUTATING] Delete a scheduled transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Schedule UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["schedules", "delete", ...input.args];
+      return ["schedules", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_sync_budget",
+    readOnly: false,
+    description: "[MUTATING] Synchronize the local budget state with the remote Actual server.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["sync", ...(input.args || [])]
+  },
+  {
+    name: "actual_clear_cache",
+    readOnly: false,
+    description: "[MUTATING] Clear local budget cache state and reset connection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["sync", "--clear", ...(input.args || [])]
+  },
+  {
+    name: "actual_run_bank_sync",
+    readOnly: false,
+    description: "[MUTATING] Trigger bank synchronization for an account.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account: { type: "string", description: "Optional account UUID" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["server", "bank-sync", ...input.args];
+      const cli = ["server", "bank-sync"];
+      if (input.account) cli.push("--account", input.account);
+      return cli;
+    }
+  },
+  {
+    name: "actual_execute",
+    readOnly: false,
+    description: `[MUTATING/GENERIC] Execute a generic command using the Actual Budget CLI. E.g., args: ['server', 'version'].
+
+**Technical Lessons & Usage Notes**:
+- **Usage**: Do not run \`actual\` CLI commands directly via bash or python \`subprocess\`. Instead, always use the provided MCP tools.
+- **Querying**: For querying, use \`actual_query\` with \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\`.
+- **Entity IDs**: Use \`actual_get_id\` with type and name to find IDs for queries.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description: "The list of arguments to pass to the CLI. Do not include the 'actual' executable name."
+        }
+      },
+      required: ["args"]
+    },
+    toCli: (input = {}) => input.args || []
+  }
+];
+
+const MCP_TOOL_MAP = new Map(MCP_TOOL_DEFINITIONS.map(t => [t.name, t]));
+
+// ───────────────────────────────────────────────────────────
 // Shared command queue and tool executor (used by all sessions)
 // ───────────────────────────────────────────────────────────
 let commandQueue = Promise.resolve();
 
-async function handleExecuteTool(name, cliArgsRaw) {
-  let cliArgs = cliArgsRaw || [];
+async function handleExecuteTool(name, toolInput) {
+  let cliArgs = [];
+
+  const toolDef = MCP_TOOL_MAP.get(name);
+  if (toolDef) {
+    // If toolInput is an array, wrap it in { args: toolInput }
+    const inputObj = Array.isArray(toolInput) ? { args: toolInput } : (toolInput || {});
+    cliArgs = toolDef.toCli(inputObj);
+  } else if (name.startsWith('actual_') && name !== 'actual_execute') {
+    // Legacy tool fallback: e.g. actual_accounts, actual_transactions, actual_sync
+    const cmd = name.replace('actual_', '').replace(/_/g, '-');
+    if (CLI_COMMANDS.includes(cmd)) {
+      const rawArgs = Array.isArray(toolInput)
+        ? toolInput
+        : (toolInput && Array.isArray(toolInput.args) ? toolInput.args : []);
+      cliArgs = [cmd, ...rawArgs];
+    } else {
+      throw new Error(`Unknown tool: ${name}`);
+    }
+  } else if (name === 'actual_execute') {
+    const rawArgs = Array.isArray(toolInput)
+      ? toolInput
+      : (toolInput && Array.isArray(toolInput.args) ? toolInput.args : []);
+    cliArgs = rawArgs;
+  } else {
+    throw new Error(`Unknown tool: ${name}`);
+  }
 
   // Extract format from args (--format json|csv|table)
   let format = 'json';
@@ -1483,18 +2604,6 @@ async function handleExecuteTool(name, cliArgsRaw) {
   const verboseIdx = cliArgs.indexOf('--verbose');
   if (verboseIdx !== -1) {
     cliArgs = [...cliArgs.slice(0, verboseIdx), ...cliArgs.slice(verboseIdx + 1)];
-  }
-
-  // If a specific tool is called, prepend the command name
-  if (name.startsWith('actual_') && name !== 'actual_execute') {
-    const cmd = name.replace('actual_', '').replace(/_/g, '-');
-    if (CLI_COMMANDS.includes(cmd)) {
-      cliArgs = [cmd, ...cliArgs];
-    } else {
-      throw new Error(`Unknown tool: ${name}`);
-    }
-  } else if (name !== 'actual_execute') {
-    throw new Error(`Unknown tool: ${name}`);
   }
 
   const extractError = (e) => {
@@ -1571,48 +2680,11 @@ function createServer() {
   });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools = Object.entries(COMMAND_SCHEMAS).map(([cmd, schema]) => ({
-      name: `actual_${cmd.replace(/-/g, '_')}`,
-      description: `Execute 'actual ${cmd}' command. ${schema.desc}\n\n${schema.details}\n\n${schema.rules}\n\nGlobal flags like --format json, --verbose are also supported. Amounts are in integer cents (e.g. 5000 = $50.00).`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          args: {
-            type: "array",
-            items: { type: "string" },
-            description: `The list of arguments/flags to pass to 'actual ${cmd}'. E.g., ["list", "--format", "json"] or ["create", "--name", "My Account"]`
-          }
-        },
-        required: ["args"]
-      }
+    const tools = MCP_TOOL_DEFINITIONS.map(t => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema
     }));
-
-    // Add the generic actual_execute tool
-    tools.push({
-      name: "actual_execute",
-      description: `Execute a generic command using the Actual Budget CLI. E.g., args: ['help'].
-
-**Technical Lessons & Usage Notes**:
-- **Usage**: Do not run \`actual\` CLI commands directly via bash or python \`subprocess\`. Instead, always use the provided MCP tools and pass arguments via the \`args\` array parameter.
-- **Querying**: Always use \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\` in the \`args\` array for \`actual_query\`.
-- **Filtering Groups**: Filter by \`category.group.name\` using \`{"$oneof": [...]}\` for multi-group reports.
-- **Output**: Include \`--format\` and \`json\` in your tool \`args\` for reliable structured parsing.
-- **Split Transactions**: Default is \`inline\`. Use \`--file\` with \`{"options": {"splits": "grouped"}}\` for parent-child relationship visibility.
-- **Entity IDs**: Use \`actual_execute\` with \`args: ["server", "get-id", "--type", "<accounts|categories|category_groups>", "--name", "<Name>"]\` to find IDs for queries.
-- **Efficiency**: Use a single \`actual_query\` call (with \`args: ["run"]\`) to fetch 12 months of transactions for historical analysis. This reduces sync overhead and execution time by 10x compared to per-month API calls. Processing monthly totals and breakdowns in Python/scripts is near-instant.`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          args: {
-            type: "array",
-            items: { type: "string" },
-            description: "The list of arguments to pass to the CLI. Do not include the 'actual' executable name."
-          }
-        },
-        required: ["args"]
-      }
-    });
-
     return { tools };
   });
 
@@ -1633,7 +2705,7 @@ function createServer() {
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const uri = request.params.uri;
     if (uri === "actual://skill-docs") {
-      const skillPath = '~/.gemini/antigravity/skills/actual/SKILL.md';
+      const skillPath = '~/.gemini/config/skills/actual-budget/SKILL.md';
       try {
         const content = await fs.readFile(skillPath, 'utf8');
         return {
@@ -1676,13 +2748,13 @@ function createServer() {
               text: `Please read the Actual Budget Skill Documentation resource at 'actual://skill-docs' to understand how to correctly query, format, and interact with the actual budget tools. Pay special attention to the advanced learnings, ActualQL querying, and transaction linking best practices.
 
 **Technical Lessons**:
-- **Usage**: Do not run \`actual\` CLI commands directly via bash or python \`subprocess\`. Instead, always use the provided MCP tools and pass arguments via the \`args\` array parameter.
-- **Querying**: Always use \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\` in the \`args\` array for \`actual_query\`.
+- **Usage**: Do not run \`actual\` CLI commands directly via bash or python \`subprocess\`. Instead, always use the provided MCP tools.
+- **Querying**: Always use \`actual_query\` with \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\`.
 - **Filtering Groups**: Filter by \`category.group.name\` using \`{"$oneof": [...]}\` for multi-group reports.
 - **Output**: Include \`--format\` and \`json\` in your tool \`args\` for reliable structured parsing.
 - **Split Transactions**: Default is \`inline\`. Use \`--file\` with \`{"options": {"splits": "grouped"}}\` for parent-child relationship visibility.
-- **Entity IDs**: Use \`actual_execute\` with \`args: ["server", "get-id", "--type", "<accounts|categories|category_groups>", "--name", "<Name>"]\` to find IDs for queries.
-- **Efficiency**: Use a single \`actual_query\` call (with \`args: ["run"]\`) to fetch 12 months of transactions for historical analysis. This reduces sync overhead and execution time by 10x compared to per-month API calls. Processing monthly totals and breakdowns in Python/scripts is near-instant.`
+- **Entity IDs**: Use \`actual_get_id\` with \`--type <accounts|categories|category_groups> --name <Name>\` to find IDs for queries.
+- **Efficiency**: Use a single \`actual_query\` call to fetch 12 months of transactions for historical analysis. This reduces sync overhead and execution time by 10x compared to per-month API calls.`
             }
           }
         ]
@@ -1694,7 +2766,7 @@ function createServer() {
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    return handleExecuteTool(name, args.args);
+    return handleExecuteTool(name, args);
   });
 
   return server;
@@ -1840,5 +2912,12 @@ process.on('exit', cleanupOnExit);
 process.on('SIGINT', () => { cleanupOnExit(); process.exit(0); });
 process.on('SIGTERM', () => { cleanupOnExit(); process.exit(0); });
 
-run().catch(console.error);
-setInterval(() => console.error('still alive'), 5000);
+const isDirectExecution = !process.argv[1] || (
+  process.argv[1].endsWith('server.js') ||
+  process.argv[1].endsWith('index.js') ||
+  process.argv[1].endsWith('actual-mcp')
+);
+
+if (isDirectExecution) {
+  run().catch(console.error);
+}
