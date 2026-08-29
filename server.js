@@ -12,11 +12,19 @@ import {
   ListResourcesRequestSchema, ReadResourceRequestSchema,
   ListPromptsRequestSchema, GetPromptRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
+import {
+  oauthMiddleware,
+  setupOAuthRoutes,
+  OAUTH_CLIENT_ID
+} from "./oauth.js";
+
+
 import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
 import os from "os";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
+
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -828,9 +836,16 @@ async function handleTransactions(subCmd, opts) {
       const ids = opts._positional.length > 0 ? opts._positional : (opts.ids ? opts.ids.split(',') : []);
       if (!ids || ids.length === 0) throw new Error('Transaction IDs are required as positional arguments');
 
+      // Sanitize IDs to prevent injection
+      for (const id of ids) {
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+          throw new Error(`Invalid transaction ID format: "${id}"`);
+        }
+      }
+
       const idsList = ids.map(id => `'${id}'`).join(', ');
       const query = `SELECT id, notes FROM transactions WHERE id IN (${idsList});`;
-      const output = execSync(`sqlite3 -json backup.sqlite "${query}"`, { encoding: 'utf8' });
+      const output = execFileSync('sqlite3', ['-json', 'backup.sqlite', query], { encoding: 'utf8' });
 
       let rows = [];
       try {
@@ -865,9 +880,17 @@ async function handleTransactions(subCmd, opts) {
       const ids = opts._positional.length > 0 ? opts._positional : (opts.ids ? opts.ids.split(',') : []);
       if (!ids || ids.length === 0) throw new Error('Transaction IDs are required as positional arguments');
 
+      // Sanitize IDs to prevent injection
+      for (const id of ids) {
+        if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+          throw new Error(`Invalid transaction ID format: "${id}"`);
+        }
+      }
+
       const idsList = ids.map(id => `'${id}'`).join(', ');
       const query = `SELECT * FROM transactions WHERE id IN (${idsList});`;
-      const output = execSync(`sqlite3 -json backup.sqlite "${query}"`, { encoding: 'utf8' });
+      const output = execFileSync('sqlite3', ['-json', 'backup.sqlite', query], { encoding: 'utf8' });
+
 
       let rows = [];
       try {
@@ -1686,9 +1709,31 @@ async function run() {
 
   if (args.port) {
     const port = parseIntFlag(args.port, "port");
+    const isAuthDisabled =
+      args["no-auth"] === true || args["no-auth"] === "true" ||
+      args["noauth"] === true || args["noauth"] === "true" ||
+      args["no-oauth"] === true || args["no-oauth"] === "true" ||
+      args["auth"] === false || args["auth"] === "false" ||
+      process.env.NO_AUTH === "true";
+    const enableAuth = !isAuthDisabled;
+
     const app = express();
+    app.disable('x-powered-by');
+    app.use((req, res, next) => {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+      next();
+    });
     app.use(cors());
-    app.use(express.json());
+    app.use(express.json({ limit: '1mb' }));
+    app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+
+    // ─── Setup OAuth2 Discovery and Endpoints ───
+    if (enableAuth) {
+      setupOAuthRoutes(app);
+    }
 
     // Per-session transport map — supports multiple concurrent clients
     const transports = new Map();
@@ -1704,7 +1749,8 @@ async function run() {
 
     // ─── Streamable HTTP Transport (protocol version 2025-11-25) ───
     // Stateless mode — each POST is self-contained, no session to manage.
-    app.all("/mcp", async (req, res) => {
+    const mcpMiddleware = enableAuth ? [oauthMiddleware] : [];
+    app.all("/mcp", ...mcpMiddleware, async (req, res) => {
       try {
         // Check for existing session
         const sessionId = req.headers['mcp-session-id'];
@@ -1728,7 +1774,8 @@ async function run() {
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sid) => {
               transports.set(sid, transport);
-              console.error(`[StreamableHTTP] New session: ${sid} (${transports.size} active)`);
+              const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
+              console.error(`[StreamableHTTP] ${clientPrefix}New session: ${sid} (${transports.size} active)`);
             }
           });
 
@@ -1766,6 +1813,12 @@ async function run() {
 
     app.listen(port, () => {
       console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (StreamableHTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+      if (enableAuth) {
+        console.error(`[OAuth] OAuth2 protection enabled (Client ID: ${OAUTH_CLIENT_ID})`);
+        console.error(`[OAuth] Discovery: http://localhost:${port}/.well-known/oauth-authorization-server`);
+      } else {
+        console.error(`[OAuth] OAuth2 protection disabled via flag`);
+      }
     });
   } else {
     const server = createServer();
