@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import express from "express";
 import cors from "cors";
 import {
@@ -18,7 +19,14 @@ import {
   OAUTH_CLIENT_ID,
   validateOAuthConfig
 } from "./oauth.js";
-
+import {
+  authStorage,
+  logCommand,
+  logMessage,
+  LOG_DIR,
+  PID_LOG_FILE,
+  COMMAND_LOG_FILE,
+} from "./logger.js";
 
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -31,8 +39,6 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const LOG_DIR = path.join(os.homedir(), 'Projects', 'actual-mcp', 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'actual-commands.log');
 const ACTUAL_RC_PATH = path.join(os.homedir(), '.actualrc.json');
 const ACTUAL_DATA_ROOT = path.join(os.homedir(), '.actual-data');
 if (!fsSync.existsSync(ACTUAL_DATA_ROOT)) {
@@ -68,59 +74,6 @@ function cleanStalePidDirs() {
 }
 
 cleanStalePidDirs();
-
-// ───────────────────────────────────────────────────────────
-// Logging
-// ───────────────────────────────────────────────────────────
-async function rotateLogIfNeeded(logPath, maxLines = 1000) {
-  try {
-    if (!fsSync.existsSync(logPath)) return;
-    const content = await fs.readFile(logPath, 'utf8');
-    let lineCount = 0;
-    for (let i = 0; i < content.length; i++) {
-      if (content[i] === '\n') lineCount++;
-    }
-    if (lineCount >= maxLines) {
-      const logDir = path.dirname(logPath);
-      const logFile = path.basename(logPath);
-      const files = await fs.readdir(logDir);
-      let maxIdx = 0;
-      for (const file of files) {
-        if (file.startsWith(logFile + '.')) {
-          const ext = file.substring(logFile.length + 1);
-          const num = parseInt(ext, 10);
-          if (!isNaN(num) && num > maxIdx) {
-            maxIdx = num;
-          }
-        }
-      }
-      for (let i = maxIdx; i >= 1; i--) {
-        const oldLog = `${logPath}.${i}`;
-        const newLog = `${logPath}.${i + 1}`;
-        if (fsSync.existsSync(oldLog)) {
-          await fs.rename(oldLog, newLog);
-        }
-      }
-      await fs.rename(logPath, `${logPath}.1`);
-    }
-  } catch (e) {
-    console.error(`Error rotating log: ${e.message}`);
-  }
-}
-
-async function logMessage(msg) {
-  const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const line = `${timestamp} - ${msg}\n`;
-  try {
-    if (!fsSync.existsSync(LOG_DIR)) {
-      await fs.mkdir(LOG_DIR, { recursive: true });
-    }
-    await rotateLogIfNeeded(LOG_FILE);
-    await fs.appendFile(LOG_FILE, line);
-  } catch (e) {
-    console.error(`Failed to write to log file: ${e.message}`);
-  }
-}
 
 // ───────────────────────────────────────────────────────────
 // Persistent API Connection
@@ -1315,7 +1268,7 @@ const COMMAND_HANDLERS = {
   server: handleServer,
 };
 
-async function executeCommand(cliArgs) {
+async function executeCommand(cliArgs, explicitClientId = null) {
   const command = cliArgs[0];
   if (!command) throw new Error('No command specified');
 
@@ -1332,15 +1285,9 @@ async function executeCommand(cliArgs) {
   // Re-parse with subcommand consumed
   const opts = { ...parsed, _positional: positionalAfterSub };
 
-  await logMessage(`${command} ${remaining.join(' ')}`);
-  const startTime = Date.now();
+  await logCommand(`${command} ${remaining.join(' ')}`, explicitClientId);
 
-  const result = await handler(subCmd || '', opts);
-
-  const elapsed = Date.now() - startTime;
-  await logMessage(`${command} completed in ${elapsed}ms`);
-
-  return result;
+  return handler(subCmd || '', opts);
 }
 
 // ───────────────────────────────────────────────────────────
@@ -2571,7 +2518,8 @@ const MCP_TOOL_MAP = new Map(MCP_TOOL_DEFINITIONS.map(t => [t.name, t]));
 // ───────────────────────────────────────────────────────────
 let commandQueue = Promise.resolve();
 
-async function handleExecuteTool(name, toolInput) {
+async function handleExecuteTool(name, toolInput, explicitClientId = null) {
+  const currentClientId = explicitClientId !== null ? explicitClientId : (authStorage.getStore()?.clientId || null);
   let cliArgs = [];
 
   const toolDef = MCP_TOOL_MAP.get(name);
@@ -2624,7 +2572,7 @@ async function handleExecuteTool(name, toolInput) {
 
   const executeWithRetry = async () => {
     try {
-      const result = await executeCommand(cliArgs);
+      const result = await executeCommand(cliArgs, currentClientId);
       const output = formatOutput(result, format);
       return {
         content: [{ type: "text", text: output }],
@@ -2634,10 +2582,10 @@ async function handleExecuteTool(name, toolInput) {
       // Retry once on SQLite corruption after rebuilding the budget
       if (isSqliteCorrupt(err)) {
         const errMsg = extractError(err);
-        await logMessage(`SQLite error detected: ${errMsg}. Rebuilding and retrying...`);
+        await logMessage(`SQLite error detected: ${errMsg}. Rebuilding and retrying...`, currentClientId);
         try {
-          await rebuildBudget();
-          const result = await executeCommand(cliArgs);
+          await rebuildBudget(currentClientId);
+          const result = await executeCommand(cliArgs, currentClientId);
           const output = formatOutput(result, format);
           return {
             content: [{ type: "text", text: output }],
@@ -2645,11 +2593,11 @@ async function handleExecuteTool(name, toolInput) {
           };
         } catch (retryErr) {
           if (isSqliteCorrupt(retryErr)) {
-            await logMessage(`FATAL: SQLite corruption persists after rebuild. Marking server as unhealthy.`);
+            await logMessage(`FATAL: SQLite corruption persists after rebuild. Marking server as unhealthy.`, currentClientId);
             isHealthy = false;
           }
           const retryMsg = extractError(retryErr);
-          await logMessage(`ERROR after rebuild retry: ${retryMsg}`);
+          await logMessage(`ERROR after rebuild retry: ${retryMsg}`, currentClientId);
           return {
             content: [{ type: "text", text: `Error (after rebuild retry): ${retryMsg}` }],
             isError: true,
@@ -2657,7 +2605,7 @@ async function handleExecuteTool(name, toolInput) {
         }
       }
       const message = extractError(err);
-      await logMessage(`ERROR: ${message}`);
+      await logMessage(`ERROR: ${message}`, currentClientId);
       return {
         content: [{ type: "text", text: `Error: ${message}` }],
         isError: true,
@@ -2774,7 +2722,8 @@ function createServer() {
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    return handleExecuteTool(name, args);
+    const currentClientId = authStorage.getStore()?.clientId || null;
+    return handleExecuteTool(name, args, currentClientId);
   });
 
   return server;
@@ -2822,6 +2771,7 @@ async function run() {
 
     // Per-session transport map — supports multiple concurrent clients
     const transports = new Map();
+    const sessionClients = new Map();
 
     // ─── Health Check Endpoint ───
     app.get("/health", (req, res) => {
@@ -2836,64 +2786,74 @@ async function run() {
     // Stateless mode — each POST is self-contained, no session to manage.
     const mcpMiddleware = enableAuth ? [oauthMiddleware] : [];
     app.all("/mcp", ...mcpMiddleware, async (req, res) => {
-      try {
-        // Check for existing session
-        const sessionId = req.headers['mcp-session-id'];
-        let transport;
+      const sessionId = req.headers['mcp-session-id'];
+      const clientId = req.oauthUser?.clientId || (sessionId ? sessionClients.get(sessionId) : null) || null;
+      if (sessionId && req.oauthUser?.clientId) {
+        sessionClients.set(sessionId, req.oauthUser.clientId);
+      }
+      return authStorage.run({ clientId }, async () => {
+        try {
+          // Check for existing session
+          let transport;
 
-        if (sessionId && transports.has(sessionId)) {
-          const existing = transports.get(sessionId);
-          if (existing instanceof StreamableHTTPServerTransport) {
-            transport = existing;
+          if (sessionId && transports.has(sessionId)) {
+            const existing = transports.get(sessionId);
+            if (existing instanceof StreamableHTTPServerTransport) {
+              transport = existing;
+            } else {
+              res.status(400).json({
+                jsonrpc: '2.0',
+                error: { code: -32000, message: 'Session exists but uses a different transport protocol' },
+                id: null
+              });
+              return;
+            }
+          } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
+            // New Streamable HTTP session
+            transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: (sid) => {
+                transports.set(sid, transport);
+                if (clientId) {
+                  sessionClients.set(sid, clientId);
+                }
+                const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
+                console.error(`[StreamableHTTP] ${clientPrefix}New session: ${sid} (${transports.size} active)`);
+              }
+            });
+
+            transport.onclose = () => {
+              const sid = transport.sessionId;
+              if (sid && transports.has(sid)) {
+                transports.delete(sid);
+                sessionClients.delete(sid);
+                console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
+              }
+            };
+
+            const server = createServer();
+            await server.connect(transport);
           } else {
             res.status(400).json({
               jsonrpc: '2.0',
-              error: { code: -32000, message: 'Session exists but uses a different transport protocol' },
+              error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
               id: null
             });
             return;
           }
-        } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
-          // New Streamable HTTP session
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (sid) => {
-              transports.set(sid, transport);
-              const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
-              console.error(`[StreamableHTTP] ${clientPrefix}New session: ${sid} (${transports.size} active)`);
-            }
-          });
 
-          transport.onclose = () => {
-            const sid = transport.sessionId;
-            if (sid && transports.has(sid)) {
-              transports.delete(sid);
-              console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
-            }
-          };
-
-          const server = createServer();
-          await server.connect(transport);
-        } else {
-          res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-            id: null
-          });
-          return;
+          await transport.handleRequest(req, res, req.body);
+        } catch (error) {
+          console.error('Error handling Streamable HTTP request:', error);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: null
+            });
+          }
         }
-
-        await transport.handleRequest(req, res, req.body);
-      } catch (error) {
-        console.error('Error handling Streamable HTTP request:', error);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: null
-          });
-        }
-      }
+      });
     });
 
     app.listen(port, () => {
