@@ -20,12 +20,27 @@ try {
 export const OAUTH_CLIENT_ID =
   process.env.OAUTH_CLIENT_ID ||
   process.env.ACTUAL_OAUTH_CLIENT_ID ||
-  "actual-mcp";
+  null;
 
 export const OAUTH_CLIENT_SECRET =
   process.env.OAUTH_CLIENT_SECRET ||
   process.env.ACTUAL_OAUTH_CLIENT_SECRET ||
   null;
+
+/**
+ * Validate that OAuth credentials are configured.
+ * Called at startup when auth is enabled — aborts early with a clear message.
+ */
+export function validateOAuthConfig() {
+  const missing = [];
+  if (!OAUTH_CLIENT_ID) missing.push("OAUTH_CLIENT_ID");
+  if (!OAUTH_CLIENT_SECRET) missing.push("OAUTH_CLIENT_SECRET");
+  if (missing.length > 0) {
+    console.error(`[OAuth] FATAL: Missing required environment variables: ${missing.join(", ")}`);
+    console.error(`[OAuth] Set them in .env or as environment variables, or start with --no-auth to disable OAuth.`);
+    process.exit(1);
+  }
+}
 
 // Parse allowed redirect domains from .env
 export function getAllowedRedirectDomains() {
@@ -99,6 +114,28 @@ function loadActiveTokens() {
   console.error(`[OAuth] Loaded ${tokenCache.size} active session token(s) from auth.sqlite.`);
 }
 loadActiveTokens();
+
+// Periodically purge expired and revoked tokens from SQLite to prevent unbounded growth
+function purgeStaleTokens() {
+  try {
+    const now = Date.now();
+    const stmt = db.prepare(`DELETE FROM oauth_tokens WHERE revoked = 1 OR expires_at <= ?`);
+    const result = stmt.run(now);
+    if (result.changes > 0) {
+      console.error(`[OAuth] Purged ${result.changes} expired/revoked token(s) from auth.sqlite.`);
+    }
+    // Also evict stale entries from the in-memory cache
+    for (const [key, val] of tokenCache.entries()) {
+      if (val.revoked || val.expires_at <= now) {
+        tokenCache.delete(key);
+      }
+    }
+  } catch (err) {
+    console.error("[OAuth] Error purging stale tokens:", err.message);
+  }
+}
+// Run token purge every hour
+setInterval(purgeStaleTokens, 60 * 60 * 1000).unref();
 
 // ─── Activity Logging Helper ───
 export function logActivity({ clientId, eventType, req, redirectUri, details }) {

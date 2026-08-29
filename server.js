@@ -15,7 +15,8 @@ import {
 import {
   oauthMiddleware,
   setupOAuthRoutes,
-  OAUTH_CLIENT_ID
+  OAUTH_CLIENT_ID,
+  validateOAuthConfig
 } from "./oauth.js";
 
 
@@ -394,6 +395,13 @@ function readJsonInput(parsed) {
     return JSON.parse(parsed.data);
   }
   if (parsed.file) {
+    if (parsed.file !== '-') {
+      // Prevent path traversal: resolve and ensure the path is within the project directory
+      const resolved = path.resolve(parsed.file);
+      if (!resolved.startsWith(__dirname + path.sep) && resolved !== __dirname) {
+        throw new Error(`Forbidden: --file path "${parsed.file}" is outside the project directory.`);
+      }
+    }
     const content = parsed.file === '-'
       ? fsSync.readFileSync(0, 'utf-8')
       : fsSync.readFileSync(parsed.file, 'utf-8');
@@ -2797,13 +2805,18 @@ async function run() {
       res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
       next();
     });
-    app.use(cors());
+    app.use(cors({
+      origin: false,  // Deny browser cross-origin requests; MCP calls don't use CORS
+      methods: ['GET', 'POST', 'DELETE'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Mcp-Session-Id'],
+    }));
     app.use(express.json({ limit: '1mb' }));
     app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 
     // ─── Setup OAuth2 Discovery and Endpoints ───
     if (enableAuth) {
+      validateOAuthConfig();
       setupOAuthRoutes(app);
     }
 
