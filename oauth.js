@@ -63,6 +63,13 @@ try {
   fs.chmodSync(DB_PATH, 0o600);
 } catch (e) {}
 
+try {
+  db.exec(`PRAGMA busy_timeout = 5000;`);
+  db.exec(`PRAGMA journal_mode = WAL;`);
+} catch (e) {
+  console.error(`[OAuth] Warning setting pragmas on auth.sqlite: ${e.message}`);
+}
+
 
 // Initialize tables
 db.exec(`

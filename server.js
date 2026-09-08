@@ -32,12 +32,14 @@ import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
 import os from "os";
-import { execFileSync } from "child_process";
+import { execFileSync, exec } from "child_process";
 
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
+import { createRequire } from "module";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
 
 const ACTUAL_RC_PATH = path.join(os.homedir(), '.actualrc.json');
 const ACTUAL_DATA_ROOT = path.join(os.homedir(), '.actual-data');
@@ -82,6 +84,14 @@ let api = null;
 let apiInitialized = false;
 let budgetLoaded = false;
 let rcConfig = null;
+let apiModuleUrl = null;
+
+async function loadApi() {
+  if (apiModuleUrl) {
+    return await import(apiModuleUrl);
+  }
+  return await import('@actual-app/api');
+}
 
 async function readActualRc() {
   try {
@@ -96,7 +106,7 @@ async function ensureInit() {
   if (apiInitialized) return;
 
   // Dynamic import of @actual-app/api
-  api = await import('@actual-app/api');
+  api = await loadApi();
   rcConfig = await readActualRc();
 
   const initOpts = {
@@ -130,7 +140,16 @@ async function ensureBudget() {
     budgetLoaded = true;
     await logMessage('Budget loaded');
   } catch (err) {
-    if (isSqliteCorrupt(err)) {
+    if (isSchemaMismatch(err)) {
+      await logMessage(`Schema mismatch during budget load: ${err.message}. Upgrading packages...`);
+      await autoUpgradePackages();
+      await logMessage(`Retrying budget download after upgrade...`);
+      await api.downloadBudget(rcConfig.syncId, {
+        password: rcConfig.encryptionPassword,
+      });
+      budgetLoaded = true;
+      await logMessage('Budget loaded successfully after upgrade');
+    } else if (isSqliteCorrupt(err)) {
       await logMessage(`SQLite corruption during budget load: ${err.message}. Rebuilding...`);
       await rebuildBudget();
     } else {
@@ -157,8 +176,101 @@ function isSqliteCorrupt(err) {
   return RETRYABLE_SQLITE_PATTERNS.some(p => msg.includes(p) || code.includes(p));
 }
 
-async function rebuildBudget() {
-  await logMessage('Rebuilding budget: shutting down API...');
+// ───────────────────────────────────────────────────────────
+// Schema Mismatch Detection & Auto-Upgrade Recovery
+// ───────────────────────────────────────────────────────────
+const SCHEMA_MISMATCH_PATTERNS = [
+  'newer database schema than this version of Actual supports',
+  'invalid-schema',
+  'uses a newer database schema',
+  'Make sure you are using the latest version',
+  'no such column: account_group_id',
+];
+
+function isSchemaMismatch(err) {
+  if (!err) return false;
+  const msg = String(err.message || err.stack || err);
+  const reason = String(err.reason || '');
+  return SCHEMA_MISMATCH_PATTERNS.some(p => msg.includes(p) || reason.includes(p));
+}
+
+let upgradeInProgress = null;
+
+async function autoUpgradePackages(explicitClientId = null) {
+  if (upgradeInProgress) {
+    await logMessage('[actual-mcp] Upgrade already in progress, awaiting completion...', explicitClientId);
+    return upgradeInProgress;
+  }
+
+  upgradeInProgress = (async () => {
+    await logMessage('[actual-mcp] Database schema mismatch detected! Starting automatic upgrade of Actual packages...', explicitClientId);
+
+    // 1. Shut down current API connection cleanly
+    if (api && apiInitialized) {
+      try { await api.shutdown(); } catch (e) { /* ignore */ }
+    }
+    apiInitialized = false;
+    budgetLoaded = false;
+    invalidateCache();
+
+    // 2. Remove instance data dir so budget re-downloads cleanly
+    try {
+      await logMessage(`[actual-mcp] Cleaning instance data dir: ${INSTANCE_DATA_DIR}`, explicitClientId);
+      await fs.rm(INSTANCE_DATA_DIR, { recursive: true, force: true });
+    } catch (e) { /* ignore */ }
+
+    // 3. Upgrade local @actual-app/api in actual-mcp
+    await logMessage('[actual-mcp] Upgrading local @actual-app/api@latest in actual-mcp...', explicitClientId);
+    await new Promise((resolve) => {
+      exec('npm install @actual-app/api@latest', { cwd: __dirname, timeout: 120000 }, (err, stdout, stderr) => {
+        if (err) {
+          logMessage(`[actual-mcp] Warning: npm install @actual-app/api@latest error: ${err.message}`, explicitClientId);
+        } else {
+          logMessage(`[actual-mcp] Successfully updated local @actual-app/api`, explicitClientId);
+        }
+        resolve();
+      });
+    });
+
+    // 4. Upgrade global @actual-app/cli
+    await logMessage('[actual-mcp] Upgrading global @actual-app/cli@latest...', explicitClientId);
+    await new Promise((resolve) => {
+      exec('npm install -g @actual-app/cli@latest', { timeout: 120000 }, (err, stdout, stderr) => {
+        if (err) {
+          logMessage(`[actual-mcp] Warning: npm install -g @actual-app/cli@latest error: ${err.message}`, explicitClientId);
+        } else {
+          logMessage(`[actual-mcp] Successfully updated global @actual-app/cli`, explicitClientId);
+        }
+        resolve();
+      });
+    });
+
+    // 5. Reload @actual-app/api with cache busting
+    await logMessage('[actual-mcp] Reloading upgraded @actual-app/api in-process...', explicitClientId);
+    try {
+      const resolved = require.resolve('@actual-app/api');
+      apiModuleUrl = `${pathToFileURL(resolved).href}?t=${Date.now()}`;
+      api = await import(apiModuleUrl);
+      await logMessage('[actual-mcp] Re-import of @actual-app/api succeeded.', explicitClientId);
+    } catch (importErr) {
+      await logMessage(`[actual-mcp] In-process reload failed: ${importErr.message}. Exiting process to allow supervisor restart.`, explicitClientId);
+      process.exit(1);
+    }
+
+    // 6. Re-init API
+    await ensureInit();
+    await logMessage('[actual-mcp] Automatic upgrade completed and API re-initialized successfully.', explicitClientId);
+  })();
+
+  try {
+    await upgradeInProgress;
+  } finally {
+    upgradeInProgress = null;
+  }
+}
+
+async function rebuildBudget(explicitClientId = null) {
+  await logMessage('Rebuilding budget: shutting down API...', explicitClientId);
 
   // Shut down the current API connection
   if (api && apiInitialized) {
@@ -170,15 +282,15 @@ async function rebuildBudget() {
 
   // Delete this instance's entire data directory and recreate it fresh
   try {
-    await logMessage(`Removing instance data dir: ${INSTANCE_DATA_DIR}`);
+    await logMessage(`Removing instance data dir: ${INSTANCE_DATA_DIR}`, explicitClientId);
     await fs.rm(INSTANCE_DATA_DIR, { recursive: true, force: true });
   } catch (e) {
-    await logMessage(`Warning: could not remove instance data dir: ${e.message}`);
+    await logMessage(`Warning: could not remove instance data dir: ${e.message}`, explicitClientId);
   }
 
   // Re-initialize and re-download
-  await logMessage('Rebuilding budget: re-initializing API...');
-  api = await import('@actual-app/api');
+  await logMessage('Rebuilding budget: re-initializing API...', explicitClientId);
+  api = await loadApi();
   const initOpts = {
     serverURL: rcConfig.serverUrl,
     dataDir: INSTANCE_DATA_DIR,
@@ -189,13 +301,13 @@ async function rebuildBudget() {
   await api.init(initOpts);
   apiInitialized = true;
 
-  await logMessage(`Rebuilding budget: downloading ${rcConfig.syncId}...`);
+  await logMessage(`Rebuilding budget: downloading ${rcConfig.syncId}...`, explicitClientId);
   await api.downloadBudget(rcConfig.syncId, {
     password: rcConfig.encryptionPassword,
   });
   budgetLoaded = true;
   invalidateCache();
-  await logMessage('Budget rebuilt successfully');
+  await logMessage('Budget rebuilt successfully', explicitClientId);
 }
 
 // ───────────────────────────────────────────────────────────
@@ -225,7 +337,13 @@ function cleanBudgetCacheSync() {
 }
 
 process.on('uncaughtException', (err) => {
-  if (isSqliteCorrupt(err)) {
+  if (isSchemaMismatch(err)) {
+    console.error(`[actual-mcp] Uncaught schema mismatch error: ${err.message}. Triggering auto-upgrade...`);
+    autoUpgradePackages().catch(e => {
+      console.error('[actual-mcp] Auto-upgrade from uncaught exception failed:', e);
+      process.exit(1);
+    });
+  } else if (isSqliteCorrupt(err)) {
     console.error(`[actual-mcp] Uncaught SQLite error: ${err.message}. Cleaning budget cache for recovery on next call...`);
     cleanBudgetCacheSync();
     // Don't exit — let the MCP server continue running.
@@ -238,7 +356,12 @@ process.on('uncaughtException', (err) => {
 });
 
 process.on('unhandledRejection', (err) => {
-  if (isSqliteCorrupt(err)) {
+  if (isSchemaMismatch(err)) {
+    console.error(`[actual-mcp] Unhandled schema mismatch rejection: ${err?.message || err}. Triggering auto-upgrade...`);
+    autoUpgradePackages().catch(e => {
+      console.error('[actual-mcp] Auto-upgrade from unhandled rejection failed:', e);
+    });
+  } else if (isSqliteCorrupt(err)) {
     console.error(`[actual-mcp] Unhandled SQLite rejection: ${err?.message || err}. Cleaning budget cache for recovery on next call...`);
     cleanBudgetCacheSync();
   } else {
@@ -689,7 +812,17 @@ async function handleBudgets(subCmd, opts) {
       const syncId = opts._positional[0];
       if (!syncId) throw new Error('syncId is required');
       const password = opts['encryption-password'] || rcConfig.encryptionPassword;
-      await api.downloadBudget(syncId, { password });
+      try {
+        await api.downloadBudget(syncId, { password });
+      } catch (err) {
+        if (isSchemaMismatch(err)) {
+          await logMessage(`Schema mismatch during budget download: ${err.message}. Upgrading packages...`);
+          await autoUpgradePackages();
+          await api.downloadBudget(syncId, { password });
+        } else {
+          throw err;
+        }
+      }
       budgetLoaded = true;
       invalidateCache();
       return { success: true, syncId };
@@ -2579,6 +2712,26 @@ async function handleExecuteTool(name, toolInput, explicitClientId = null) {
         isError: false,
       };
     } catch (err) {
+      if (isSchemaMismatch(err)) {
+        const errMsg = extractError(err);
+        await logMessage(`Schema mismatch detected: ${errMsg}. Upgrading Actual packages and retrying...`, currentClientId);
+        try {
+          await autoUpgradePackages(currentClientId);
+          const result = await executeCommand(cliArgs, currentClientId);
+          const output = formatOutput(result, format);
+          return {
+            content: [{ type: "text", text: output }],
+            isError: false,
+          };
+        } catch (retryErr) {
+          const retryMsg = extractError(retryErr);
+          await logMessage(`ERROR after upgrade retry: ${retryMsg}`, currentClientId);
+          return {
+            content: [{ type: "text", text: `Error (after upgrade retry): ${retryMsg}` }],
+            isError: true,
+          };
+        }
+      }
       // Retry once on SQLite corruption after rebuilding the budget
       if (isSqliteCorrupt(err)) {
         const errMsg = extractError(err);

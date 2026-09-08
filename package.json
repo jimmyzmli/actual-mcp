@@ -10,7 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@actual-app/api": "^26.7.0",
+    "@actual-app/api": "^26.9.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.6",
     "express": "^5.2.1"
