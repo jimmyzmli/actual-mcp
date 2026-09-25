@@ -1,14 +1,22 @@
 {
-  "name": "mcp-server",
+  "name": "actual-mcp",
   "version": "2.0.0",
+  "description": "Model Context Protocol (MCP) server for Actual Budget with Streamable HTTP, OAuth2, and Stdio support",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "cleanup": "node cleanup.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": [
+    "actual-budget",
+    "mcp",
+    "model-context-protocol",
+    "personal-finance",
+    "ai-agents"
+  ],
+  "author": "Jimmy Li",
+  "license": "MIT",
   "dependencies": {
     "@actual-app/api": "^26.9.0",
     "@modelcontextprotocol/sdk": "^1.29.0",

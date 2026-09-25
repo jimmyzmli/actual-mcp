@@ -41,8 +41,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 
-const ACTUAL_RC_PATH = path.join(os.homedir(), '.actualrc.json');
-const ACTUAL_DATA_ROOT = path.join(os.homedir(), '.actual-data');
+// Load .env file if present
+try {
+  const envPath = path.join(__dirname, ".env");
+  if (fsSync.existsSync(envPath)) {
+    process.loadEnvFile(envPath);
+  }
+} catch (e) {
+  // Ignore
+}
+
+const ACTUAL_RC_PATH = process.env.ACTUAL_RC_PATH || path.join(os.homedir(), '.actualrc.json');
+const ACTUAL_DATA_ROOT = process.env.ACTUAL_DATA_DIR || path.join(os.homedir(), '.actual-data');
 if (!fsSync.existsSync(ACTUAL_DATA_ROOT)) {
   fsSync.mkdirSync(ACTUAL_DATA_ROOT, { recursive: true });
 }
@@ -102,6 +112,22 @@ async function readActualRc() {
   }
 }
 
+function getServerUrl() {
+  return process.env.ACTUAL_SERVER_URL || rcConfig?.serverUrl;
+}
+
+function getServerPassword() {
+  return process.env.ACTUAL_PASSWORD || rcConfig?.password;
+}
+
+function getSyncId() {
+  return process.env.ACTUAL_SYNC_ID || rcConfig?.syncId;
+}
+
+function getEncryptionPassword() {
+  return process.env.ACTUAL_ENCRYPTION_PASSWORD || rcConfig?.encryptionPassword;
+}
+
 async function ensureInit() {
   if (apiInitialized) return;
 
@@ -109,13 +135,16 @@ async function ensureInit() {
   api = await loadApi();
   rcConfig = await readActualRc();
 
+  const serverURL = getServerUrl();
+  const password = getServerPassword();
+
   const initOpts = {
-    serverURL: rcConfig.serverUrl,
+    serverURL,
     dataDir: INSTANCE_DATA_DIR,
   };
 
-  if (rcConfig.password) {
-    initOpts.password = rcConfig.password;
+  if (password) {
+    initOpts.password = password;
   }
 
   await logMessage('API init: connecting to server...');
@@ -128,14 +157,17 @@ async function ensureBudget() {
   await ensureInit();
   if (budgetLoaded) return;
 
-  if (!rcConfig.syncId) {
-    throw new Error('syncId not found in .actualrc.json — cannot load budget');
+  const syncId = getSyncId();
+  const encryptionPassword = getEncryptionPassword();
+
+  if (!syncId) {
+    throw new Error('syncId not found in .actualrc.json or ACTUAL_SYNC_ID environment variable — cannot load budget');
   }
 
   try {
-    await logMessage(`Downloading budget ${rcConfig.syncId}...`);
-    await api.downloadBudget(rcConfig.syncId, {
-      password: rcConfig.encryptionPassword,
+    await logMessage(`Downloading budget ${syncId}...`);
+    await api.downloadBudget(syncId, {
+      password: encryptionPassword,
     });
     budgetLoaded = true;
     await logMessage('Budget loaded');
@@ -144,8 +176,8 @@ async function ensureBudget() {
       await logMessage(`Schema mismatch during budget load: ${err.message}. Upgrading packages...`);
       await autoUpgradePackages();
       await logMessage(`Retrying budget download after upgrade...`);
-      await api.downloadBudget(rcConfig.syncId, {
-        password: rcConfig.encryptionPassword,
+      await api.downloadBudget(syncId, {
+        password: encryptionPassword,
       });
       budgetLoaded = true;
       await logMessage('Budget loaded successfully after upgrade');
@@ -291,19 +323,24 @@ async function rebuildBudget(explicitClientId = null) {
   // Re-initialize and re-download
   await logMessage('Rebuilding budget: re-initializing API...', explicitClientId);
   api = await loadApi();
+  const serverURL = getServerUrl();
+  const password = getServerPassword();
+  const syncId = getSyncId();
+  const encryptionPassword = getEncryptionPassword();
+
   const initOpts = {
-    serverURL: rcConfig.serverUrl,
+    serverURL,
     dataDir: INSTANCE_DATA_DIR,
   };
-  if (rcConfig.password) {
-    initOpts.password = rcConfig.password;
+  if (password) {
+    initOpts.password = password;
   }
   await api.init(initOpts);
   apiInitialized = true;
 
-  await logMessage(`Rebuilding budget: downloading ${rcConfig.syncId}...`, explicitClientId);
-  await api.downloadBudget(rcConfig.syncId, {
-    password: rcConfig.encryptionPassword,
+  await logMessage(`Rebuilding budget: downloading ${syncId}...`, explicitClientId);
+  await api.downloadBudget(syncId, {
+    password: encryptionPassword,
   });
   budgetLoaded = true;
   invalidateCache();
@@ -809,9 +846,9 @@ async function handleBudgets(subCmd, opts) {
     }
     case 'download': {
       await ensureInit();
-      const syncId = opts._positional[0];
+      const syncId = opts._positional[0] || getSyncId();
       if (!syncId) throw new Error('syncId is required');
-      const password = opts['encryption-password'] || rcConfig.encryptionPassword;
+      const password = opts['encryption-password'] || getEncryptionPassword();
       try {
         await api.downloadBudget(syncId, { password });
       } catch (err) {
@@ -2814,21 +2851,48 @@ function createServer() {
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const uri = request.params.uri;
     if (uri === "actual://skill-docs") {
-      const skillPath = '~/.gemini/config/skills/actual-budget/SKILL.md';
-      try {
-        const content = await fs.readFile(skillPath, 'utf8');
-        return {
-          contents: [
-            {
-              uri: "actual://skill-docs",
-              mimeType: "text/markdown",
-              text: content
-            }
-          ]
-        };
-      } catch (e) {
-        throw new Error(`Failed to read SKILL.md: ${e.message}`);
+      const candidates = [
+        process.env.ACTUAL_SKILL_PATH,
+        path.join(__dirname, 'SKILL.md'),
+        path.join(os.homedir(), '.gemini/config/skills/actual-budget/SKILL.md'),
+      ].filter(Boolean);
+
+      let content = null;
+      for (const p of candidates) {
+        try {
+          if (fsSync.existsSync(p)) {
+            content = await fs.readFile(p, 'utf8');
+            break;
+          }
+        } catch (e) {}
       }
+
+      if (!content) {
+        content = `# Actual Budget MCP Documentation & Best Practices
+
+## Overview
+This server provides tools to query and mutate Actual Budget entities via the official Actual API.
+
+## Core Technical Guidelines
+- **Usage**: Use the MCP tools rather than executing direct CLI subprocesses.
+- **Querying**: Query transactions using \`actual_query\` with \`--select "date,amount,payee.name,notes,category.name,category.group.name,account.name,account.offbudget"\`.
+- **Filtering Groups**: Filter by \`category.group.name\` using \`{"$oneof": [...]}\` for multi-group reports.
+- **Output**: Use \`--format json\` for reliable structured parsing.
+- **Amounts**: Stored as integer cents (e.g., 1000 = $10.00). Positive represents deposit/income, negative represents expense.
+- **Entity IDs**: Use \`actual_get_id\` with \`--type <accounts|categories|category_groups> --name <Name>\` to resolve names to UUIDs.
+- **Split Transactions**: Default is \`inline\`. Pass options with \`splits: "grouped"\` for parent-child relationship visibility.
+`;
+      }
+
+      return {
+        contents: [
+          {
+            uri: "actual://skill-docs",
+            mimeType: "text/markdown",
+            text: content
+          }
+        ]
+      };
     }
     throw new Error(`Unknown resource: ${uri}`);
   });
