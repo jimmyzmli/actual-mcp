@@ -1,7 +1,21 @@
 #!/usr/bin/env node
 
+import net from "node:net";
+import dns from "node:dns";
+
+// Disable Happy Eyeballs / network family autoselection and prefer IPv4.
+// Prevents connection timeouts when remote hosts advertise AAAA records (e.g. Pikapod)
+// but local routing/ISP cannot reach the IPv6 destination.
+if (typeof net.setDefaultAutoSelectFamily === "function") {
+  net.setDefaultAutoSelectFamily(false);
+}
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
@@ -217,6 +231,9 @@ const SCHEMA_MISMATCH_PATTERNS = [
   'uses a newer database schema',
   'Make sure you are using the latest version',
   'no such column: account_group_id',
+  'out-of-sync-migrations',
+  'Database is out of sync with migrations',
+  'Cannot destructure property \'id\' of \'getPrefs(...)\'',
 ];
 
 function isSchemaMismatch(err) {
@@ -3017,6 +3034,9 @@ async function run() {
             const existing = transports.get(sessionId);
             if (existing instanceof StreamableHTTPServerTransport) {
               transport = existing;
+            } else if (existing instanceof SSEServerTransport) {
+              await existing.handlePostMessage(req, res, req.body);
+              return;
             } else {
               res.status(400).json({
                 jsonrpc: '2.0',
@@ -3025,6 +3045,26 @@ async function run() {
               });
               return;
             }
+          } else if (!sessionId && req.method === 'GET' && (req.headers['accept']?.includes('text/event-stream') || req.path === '/sse')) {
+            // Standalone SSE stream request (e.g. from IDE or older SSE clients)
+            const sseTransport = new SSEServerTransport("/messages", res);
+            const sid = sseTransport.sessionId;
+            transports.set(sid, sseTransport);
+            if (clientId) {
+              sessionClients.set(sid, clientId);
+            }
+            const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
+            console.error(`[SSE] ${clientPrefix}New session: ${sid} (${transports.size} active)`);
+
+            res.on('close', () => {
+              transports.delete(sid);
+              sessionClients.delete(sid);
+              console.error(`[SSE] Session closed: ${sid} (${transports.size} active)`);
+            });
+
+            const server = createServer();
+            await server.connect(sseTransport);
+            return;
           } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
             // New Streamable HTTP session
             transport = new StreamableHTTPServerTransport({
@@ -3069,6 +3109,48 @@ async function run() {
               id: null
             });
           }
+        }
+      });
+    });
+
+    // ─── SSE Transport (protocol version 2024-11-05) ───
+    app.get("/sse", ...mcpMiddleware, async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'];
+      const clientId = req.oauthUser?.clientId || (sessionId ? sessionClients.get(sessionId) : null) || null;
+      return authStorage.run({ clientId }, async () => {
+        const transport = new SSEServerTransport("/messages", res);
+        const sid = transport.sessionId;
+        transports.set(sid, transport);
+        if (clientId) {
+          sessionClients.set(sid, clientId);
+        }
+        const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
+        console.error(`[SSE] ${clientPrefix}New session on /sse: ${sid} (${transports.size} active)`);
+
+        res.on('close', () => {
+          transports.delete(sid);
+          sessionClients.delete(sid);
+          console.error(`[SSE] Session closed: ${sid} (${transports.size} active)`);
+        });
+
+        const server = createServer();
+        await server.connect(transport);
+      });
+    });
+
+    app.post("/messages", ...mcpMiddleware, async (req, res) => {
+      const sessionId = req.query.sessionId || req.headers['mcp-session-id'];
+      const clientId = req.oauthUser?.clientId || (sessionId ? sessionClients.get(sessionId) : null) || null;
+      return authStorage.run({ clientId }, async () => {
+        const transport = transports.get(sessionId);
+        if (transport && transport instanceof SSEServerTransport) {
+          await transport.handlePostMessage(req, res, req.body);
+        } else {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'No active SSE session found for sessionId' },
+            id: null
+          });
         }
       });
     });

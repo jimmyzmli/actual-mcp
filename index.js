@@ -1,6 +1,15 @@
-// wrapper.js — MCP stdout must be clean JSON protocol.
-// -v / --verbose: redirect console.log/info/warn/debug to stderr
-// otherwise: suppress them entirely
+import net from 'node:net';
+import dns from 'node:dns';
+
+// Disable Happy Eyeballs / network family autoselection and prefer IPv4.
+// Prevents connection timeouts when remote hosts advertise AAAA records (e.g. Pikapod)
+// but local routing/ISP cannot reach the IPv6 destination.
+if (typeof net.setDefaultAutoSelectFamily === 'function') {
+  net.setDefaultAutoSelectFamily(false);
+}
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const verbose = process.argv.includes('-v') || process.argv.includes('--verbose');
 
