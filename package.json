@@ -18,7 +18,7 @@
   "author": "Jimmy Li",
   "license": "MIT",
   "dependencies": {
-    "@actual-app/api": "^26.10.0",
+    "@actual-app/api": "^26.11.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.6",
     "express": "^5.2.1"
