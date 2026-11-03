@@ -41,7 +41,7 @@ import {
   PID_LOG_FILE,
   COMMAND_LOG_FILE,
 } from "./logger.js";
-import { handleReceipts, queryReceipts } from "./pocketbase.js";
+import { handleReceipts, queryReceipts, enrichTransactionsWithReceipts } from "./pocketbase.js";
 
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -623,6 +623,8 @@ const TABLE_SCHEMA = {
     parent_id: { type: 'id' },
     sort_order: { type: 'float' },
     schedule: { type: 'id', ref: 'schedules' },
+    has_receipt: { type: 'boolean' },
+    receipt: { type: 'json' },
     'account.name': { type: 'string', ref: 'accounts' },
     'payee.name': { type: 'string', ref: 'payees' },
     'category.name': { type: 'string', ref: 'categories' },
@@ -955,7 +957,11 @@ async function handleTransactions(subCmd, opts) {
       if (!opts.account) throw new Error('--account is required');
       if (!opts.start) throw new Error('--start is required');
       if (!opts.end) throw new Error('--end is required');
-      return await api.getTransactions(opts.account, opts.start, opts.end);
+      const txs = await api.getTransactions(opts.account, opts.start, opts.end);
+      if (opts['no-receipts'] || opts.no_receipts || opts['with-receipts'] === false) {
+        return txs;
+      }
+      return enrichTransactionsWithReceipts(txs);
     }
     case 'add': {
       await ensureBudget();
@@ -1433,7 +1439,13 @@ async function handleQuery(subCmd, opts) {
       if (opts.count) {
         return { count: result.data };
       }
-      return result.data;
+      const data = result.data;
+      if (Array.isArray(data) && (opts.table === 'transactions' || !opts.table)) {
+        if (!opts['no-receipts'] && !opts.no_receipts && opts['with-receipts'] !== false) {
+          return enrichTransactionsWithReceipts(data);
+        }
+      }
+      return data;
     }
     default:
       throw new Error(`Unknown query subcommand: ${subCmd}`);
@@ -1544,7 +1556,7 @@ const COMMAND_SCHEMAS = {
   transactions: {
     desc: "Manage transactions.",
     details: "Subcommands:\n" +
-      "- list --account <id> --start <YYYY-MM-DD> --end <YYYY-MM-DD>\n" +
+      "- list --account <id> --start <YYYY-MM-DD> --end <YYYY-MM-DD> [--no-receipts]\n" +
       "- add --account <id> (--data <json> | --file <path>) [--learn-categories] [--run-transfers]\n" +
       "- import --account <id> (--data <json> | --file <path>) [--dry-run]\n" +
       "- update <id> (--data <json> | --file <path>)\n" +
@@ -1822,13 +1834,14 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_list_transactions",
     readOnly: true,
-    description: "[READ-ONLY] List transactions for a specific account within a date range.",
+    description: "[READ-ONLY] List transactions for a specific account within a date range. Automatically attaches matching receipt metadata and image URLs.",
     inputSchema: {
       type: "object",
       properties: {
         account: { type: "string", description: "Account UUID" },
         start: { type: "string", description: "Start date (YYYY-MM-DD)" },
         end: { type: "string", description: "End date (YYYY-MM-DD)" },
+        no_receipts: { type: "boolean", description: "Set true to disable automatic receipt enrichment (default: false)" },
         args: { type: "array", items: { type: "string" } }
       },
       required: ["account", "start", "end"]
@@ -1839,6 +1852,7 @@ export const MCP_TOOL_DEFINITIONS = [
       if (input.account) cli.push("--account", input.account);
       if (input.start) cli.push("--start", input.start);
       if (input.end) cli.push("--end", input.end);
+      if (input.no_receipts || input["no-receipts"]) cli.push("--no-receipts");
       return cli;
     }
   },
@@ -2084,6 +2098,29 @@ export const MCP_TOOL_DEFINITIONS = [
       const cli = ["receipts", "image", input.id];
       if (input.filename) cli.push("--filename", input.filename);
       if (input.page_index !== undefined) cli.push("--page-index", String(input.page_index));
+      return cli;
+    }
+  },
+  {
+    name: "actual_get_receipts_for_transactions",
+    readOnly: true,
+    description: "[READ-ONLY] Batch retrieve matching receipts for a list of Actual Budget transaction IDs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tx_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of Actual Budget transaction UUIDs"
+        },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["tx_ids"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "for-transactions", ...input.args];
+      const cli = ["receipts", "for-transactions"];
+      if (input.tx_ids) cli.push("--tx-ids", Array.isArray(input.tx_ids) ? input.tx_ids.join(",") : input.tx_ids);
       return cli;
     }
   },

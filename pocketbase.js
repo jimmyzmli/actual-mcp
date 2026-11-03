@@ -646,6 +646,73 @@ export function listReceipts(opts = {}) {
   return rows.map(formatReceiptOutput);
 }
 
+// ─── Batch Receipt Lookup by Transaction IDs ───
+export function getReceiptsForTransactions(txIds) {
+  if (!Array.isArray(txIds) || txIds.length === 0) return new Map();
+  const map = new Map();
+  const chunkSize = 400; // SQLite variable limit safety
+  for (let i = 0; i < txIds.length; i += chunkSize) {
+    const chunk = txIds.slice(i, i + chunkSize).filter(Boolean);
+    if (chunk.length === 0) continue;
+    const placeholders = chunk.map(() => "?").join(", ");
+    const sql = `
+      SELECT id, tx_id, tx_id_transfer, payee, amount, date, source, source_ref, image, collection_id, flag, lines, parsed
+      FROM receipts
+      WHERE tx_id IN (${placeholders}) OR tx_id_transfer IN (${placeholders})
+    `;
+    const rows = db.prepare(sql).all(...chunk, ...chunk);
+    for (const row of rows) {
+      const formatted = formatReceiptOutput(row);
+      const summary = {
+        id: formatted.id,
+        payee: formatted.payee,
+        amount: formatted.amount,
+        date: formatted.date,
+        source: formatted.source,
+        source_ref: formatted.source_ref,
+        has_image: Array.isArray(formatted.image) && formatted.image.length > 0,
+        image_urls: formatted.image_urls,
+        item_count: Array.isArray(formatted.lines) ? formatted.lines.length : 0,
+      };
+      if (row.tx_id) {
+        if (!map.has(row.tx_id)) map.set(row.tx_id, []);
+        map.get(row.tx_id).push(summary);
+      }
+      if (row.tx_id_transfer && row.tx_id_transfer !== row.tx_id) {
+        if (!map.has(row.tx_id_transfer)) map.set(row.tx_id_transfer, []);
+        map.get(row.tx_id_transfer).push(summary);
+      }
+    }
+  }
+  return map;
+}
+
+// ─── In-Flight Transaction Receipt Enrichment ───
+export function enrichTransactionsWithReceipts(transactions) {
+  if (!Array.isArray(transactions) || transactions.length === 0) {
+    return transactions;
+  }
+  const txIds = [];
+  for (const tx of transactions) {
+    if (tx && typeof tx === "object" && typeof tx.id === "string" && tx.id) {
+      txIds.push(tx.id);
+    }
+  }
+  if (txIds.length === 0) return transactions;
+
+  const receiptMap = getReceiptsForTransactions(txIds);
+  return transactions.map(tx => {
+    if (!tx || typeof tx !== "object" || !tx.id) return tx;
+    const receipts = receiptMap.get(tx.id) || [];
+    return {
+      ...tx,
+      has_receipt: receipts.length > 0,
+      receipt: receipts.length > 0 ? receipts[0] : null,
+      ...(receipts.length > 1 ? { receipts } : {}),
+    };
+  });
+}
+
 // ─── Save / Upsert Receipt ───
 export async function saveReceipt(data) {
   let existingId = data.id || data.receipt_id || null;
@@ -1233,8 +1300,15 @@ export async function handleReceipts(subCmd, opts) {
     case "sync": {
       return await syncReceipts({ full: !!opts.full });
     }
+    case "for-transactions":
+    case "by-transactions": {
+      const tx_ids = opts.tx_ids || (opts._positional ? opts._positional : []);
+      const ids = Array.isArray(tx_ids) ? tx_ids : String(tx_ids).split(",").map(s => s.trim()).filter(Boolean);
+      const map = getReceiptsForTransactions(ids);
+      return Object.fromEntries(map);
+    }
     default:
-      throw new Error(`Unknown receipts subcommand: "${subCmd}". Available: list, get, image, link, unlink, exists, save, delete, sync`);
+      throw new Error(`Unknown receipts subcommand: "${subCmd}". Available: list, get, image, link, unlink, exists, save, delete, sync, for-transactions`);
   }
 }
 
