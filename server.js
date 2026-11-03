@@ -676,6 +676,9 @@ const TABLE_SCHEMA = {
     lines: { type: 'json' },
     parsed: { type: 'json' },
     flag: { type: 'string' },
+    image: { type: 'json' },
+    image_urls: { type: 'json' },
+    collection_id: { type: 'string' },
     created: { type: 'string' },
     updated: { type: 'string' },
   },
@@ -930,6 +933,15 @@ async function handleBudgets(subCmd, opts) {
       await ensureBudget();
       await api.resetBudgetHold(opts.month);
       return { success: true };
+    }
+    case 'export': {
+      await ensureBudget();
+      const zipBytes = await api.exportBudget();
+      return {
+        success: true,
+        data: Buffer.from(zipBytes).toString('base64'),
+        size: zipBytes.length
+      };
     }
     default:
       throw new Error(`Unknown budgets subcommand: ${subCmd}`);
@@ -1525,7 +1537,8 @@ const COMMAND_SCHEMAS = {
       "- set-amount --month <YYYY-MM> --category <id> --amount <cents>\n" +
       "- set-carryover --month <YYYY-MM> --category <id> --flag <bool>\n" +
       "- hold-next-month --month <YYYY-MM> --amount <cents>\n" +
-      "- reset-hold --month <YYYY-MM>",
+      "- reset-hold --month <YYYY-MM>\n" +
+      "- export",
     rules: "Rules:\n- Budgets list does not require syncId.\n- `--month` must be formatted as YYYY-MM."
   },
   transactions: {
@@ -1624,8 +1637,11 @@ const COMMAND_SCHEMAS = {
   receipts: {
     desc: "Manage and query receipts (PocketBase backed with local SQLite cache).",
     details: "Subcommands:\n" +
-      "- list [--tx-id <id>] [--tx-ids <id1,id2>] [--date <YYYY-MM-DD>] [--start <YYYY-MM-DD>] [--end <YYYY-MM-DD>] [--source <src>] [--source-ref <ref>] [--source-hash <hash>] [--payee <name>] [--limit <n>] [--offset <n>]\n" +
+      "- list [--tx-id <id>] [--tx-ids <id1,id2>] [--unlinked-only] [--date <YYYY-MM-DD>] [--start <YYYY-MM-DD>] [--end <YYYY-MM-DD>] [--source <src>] [--source-ref <ref>] [--source-hash <hash>] [--payee <name>] [--search <str>] [--limit <n>] [--offset <n>]\n" +
       "- get <id> [--tx-id <id>] [--source-hash <hash>] [--source-ref <ref>]\n" +
+      "- image <id> [--filename <name>] [--page-index <n>]\n" +
+      "- link <id> --tx-id <id> [--tx-id-transfer <id>]\n" +
+      "- unlink <id>\n" +
       "- exists [--source-hash <hash>] [--source-ref <ref>] [--tx-id <id>] [--active-only]\n" +
       "- save (--data <json> | --file <path>)\n" +
       "- delete <id> [--source-hash <hash>] [--tx-id <id>]\n" +
@@ -1761,6 +1777,18 @@ export const MCP_TOOL_DEFINITIONS = [
       }
     },
     toCli: (input = {}) => ["budgets", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_export_budget",
+    readOnly: true,
+    description: "[READ-ONLY] Export the current Actual Budget database as a base64-encoded ZIP archive (containing db.sqlite and metadata.json).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["budgets", "export", ...(input.args || [])]
   },
   {
     name: "actual_list_budget_months",
@@ -1972,12 +2000,13 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_list_receipts",
     readOnly: true,
-    description: "[READ-ONLY] List receipts stored in PocketBase (cached locally in SQLite for fast lookup). Supports filtering by tx_id, date, source, payee, etc.",
+    description: "[READ-ONLY] List receipts stored in PocketBase (cached locally in SQLite for fast lookup). Supports filtering by tx_id, date, source, payee, search keyword, or unlinked_only.",
     inputSchema: {
       type: "object",
       properties: {
         tx_id: { type: "string", description: "Filter by Actual Budget transaction ID" },
         tx_ids: { type: "array", items: { type: "string" }, description: "Filter by multiple transaction IDs" },
+        unlinked_only: { type: "boolean", description: "Filter only unlinked receipts (tx_id is empty or null)" },
         date: { type: "string", description: "Exact date (YYYY-MM-DD)" },
         start: { type: "string", description: "Start date (YYYY-MM-DD)" },
         end: { type: "string", description: "End date (YYYY-MM-DD)" },
@@ -1985,6 +2014,7 @@ export const MCP_TOOL_DEFINITIONS = [
         source_ref: { type: "string", description: "Source reference (e.g. filename, email message ID)" },
         source_hash: { type: "string", description: "SHA-256 hash of receipt source" },
         payee: { type: "string", description: "Payee name search" },
+        search: { type: "string", description: "Full keyword search across payee, source_ref, lines, and parsed text" },
         limit: { type: "integer", description: "Maximum rows to return (default: 100)" },
         offset: { type: "integer", description: "Offset for pagination" },
         active_only: { type: "boolean", description: "Exclude ignored receipts" },
@@ -1996,6 +2026,7 @@ export const MCP_TOOL_DEFINITIONS = [
       const cli = ["receipts", "list"];
       if (input.tx_id) cli.push("--tx-id", input.tx_id);
       if (input.tx_ids) cli.push("--tx-ids", Array.isArray(input.tx_ids) ? input.tx_ids.join(",") : input.tx_ids);
+      if (input.unlinked_only) cli.push("--unlinked-only");
       if (input.date) cli.push("--date", input.date);
       if (input.start) cli.push("--start", input.start);
       if (input.end) cli.push("--end", input.end);
@@ -2003,6 +2034,7 @@ export const MCP_TOOL_DEFINITIONS = [
       if (input.source_ref) cli.push("--source-ref", input.source_ref);
       if (input.source_hash) cli.push("--source-hash", input.source_hash);
       if (input.payee) cli.push("--payee", input.payee);
+      if (input.search) cli.push("--search", input.search);
       if (input.limit !== undefined) cli.push("--limit", String(input.limit));
       if (input.offset !== undefined) cli.push("--offset", String(input.offset));
       if (input.active_only) cli.push("--active-only");
@@ -2030,6 +2062,28 @@ export const MCP_TOOL_DEFINITIONS = [
       if (input.tx_id) cli.push("--tx-id", input.tx_id);
       if (input.source_hash) cli.push("--source-hash", input.source_hash);
       if (input.source_ref) cli.push("--source-ref", input.source_ref);
+      return cli;
+    }
+  },
+  {
+    name: "actual_get_receipt_image",
+    readOnly: true,
+    description: "[READ-ONLY] Fetch receipt image binary (as base64) and direct PocketBase URL by receipt record ID and optional page index or filename.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "PocketBase receipt record ID" },
+        filename: { type: "string", description: "Specific image filename (defaults to first attached image)" },
+        page_index: { type: "integer", description: "Image index if multiple pages/images attached (default: 0)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "image", ...input.args];
+      const cli = ["receipts", "image", input.id];
+      if (input.filename) cli.push("--filename", input.filename);
+      if (input.page_index !== undefined) cli.push("--page-index", String(input.page_index));
       return cli;
     }
   },
@@ -2797,10 +2851,11 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_save_receipt",
     readOnly: false,
-    description: "[MUTATING] Save or update a receipt in PocketBase and local cache, linking it to an Actual Budget transaction.",
+    description: "[MUTATING] Save or update a receipt in PocketBase and local cache, linking it to an Actual Budget transaction. Supports attaching images via base64 or file paths.",
     inputSchema: {
       type: "object",
       properties: {
+        id: { type: "string", description: "PocketBase record ID (if updating existing receipt)" },
         tx_id: { type: "string", description: "Actual Budget transaction UUID" },
         tx_id_transfer: { type: "string", description: "Transfer transaction UUID" },
         date: { type: "string", description: "Transaction date (YYYY-MM-DD)" },
@@ -2812,6 +2867,24 @@ export const MCP_TOOL_DEFINITIONS = [
         lines: { type: ["array", "string"], description: "Extracted line items array or JSON string" },
         parsed: { type: ["object", "string"], description: "Full parsed data object or JSON string" },
         flag: { type: "string", description: "Flag or tags (e.g. ignore)" },
+        images: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              filename: { type: "string" },
+              data_base64: { type: "string" },
+              mime_type: { type: "string" }
+            },
+            required: ["data_base64"]
+          },
+          description: "Base64-encoded receipt images"
+        },
+        image_paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Local filesystem paths to receipt images"
+        },
         data: { type: ["object", "string"], description: "Full receipt payload" },
         args: { type: "array", items: { type: "string" } }
       }
@@ -2822,6 +2895,44 @@ export const MCP_TOOL_DEFINITIONS = [
       const payload = input.data ? (typeof input.data === 'string' ? input.data : JSON.stringify(input.data)) : JSON.stringify(input);
       cli.push("--data", payload);
       return cli;
+    }
+  },
+  {
+    name: "actual_link_receipt",
+    readOnly: false,
+    description: "[MUTATING] Link an existing PocketBase receipt to an Actual Budget transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        receipt_id: { type: "string", description: "PocketBase receipt record ID" },
+        tx_id: { type: "string", description: "Actual Budget transaction UUID" },
+        tx_id_transfer: { type: "string", description: "Transfer transaction UUID (optional)" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["receipt_id", "tx_id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "link", ...input.args];
+      const cli = ["receipts", "link", input.receipt_id, "--tx-id", input.tx_id];
+      if (input.tx_id_transfer) cli.push("--tx-id-transfer", input.tx_id_transfer);
+      return cli;
+    }
+  },
+  {
+    name: "actual_unlink_receipt",
+    readOnly: false,
+    description: "[MUTATING] Unlink a PocketBase receipt from an Actual Budget transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        receipt_id: { type: "string", description: "PocketBase receipt record ID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["receipt_id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "unlink", ...input.args];
+      return ["receipts", "unlink", input.receipt_id];
     }
   },
   {

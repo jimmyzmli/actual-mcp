@@ -59,13 +59,19 @@ try {
   fs.chmodSync(DB_PATH, 0o600);
 } catch (e) {}
 
+// Configure SQLite pragmas for high performance zero-copy reads, WAL, and fast writes
 try {
   db.exec(`PRAGMA busy_timeout = 5000;`);
   db.exec(`PRAGMA journal_mode = WAL;`);
+  db.exec(`PRAGMA synchronous = NORMAL;`);
+  db.exec(`PRAGMA mmap_size = 268435456;`); // 256 MB memory-mapped I/O
+  db.exec(`PRAGMA cache_size = -64000;`);   // 64 MB in-memory page cache
+  db.exec(`PRAGMA temp_store = MEMORY;`);
 } catch (e) {
   console.error(`[PocketBase] Warning setting pragmas on pocketbase.sqlite: ${e.message}`);
 }
 
+// Initialize tables and comprehensive indexes
 db.exec(`
   CREATE TABLE IF NOT EXISTS receipts (
     id TEXT PRIMARY KEY,
@@ -80,20 +86,48 @@ db.exec(`
     lines TEXT,
     parsed TEXT,
     flag TEXT,
+    image TEXT,
+    collection_id TEXT,
     created TEXT,
     updated TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_receipts_tx_id ON receipts(tx_id);
+  CREATE INDEX IF NOT EXISTS idx_receipts_tx_id_transfer ON receipts(tx_id_transfer);
   CREATE INDEX IF NOT EXISTS idx_receipts_source_hash ON receipts(source_hash);
   CREATE INDEX IF NOT EXISTS idx_receipts_source_ref ON receipts(source_ref);
   CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(date);
   CREATE INDEX IF NOT EXISTS idx_receipts_payee ON receipts(payee);
   CREATE INDEX IF NOT EXISTS idx_receipts_source ON receipts(source);
+  CREATE INDEX IF NOT EXISTS idx_receipts_date_created ON receipts(date DESC, created DESC);
+  CREATE INDEX IF NOT EXISTS idx_receipts_unlinked ON receipts(date DESC, created DESC)
+    WHERE (tx_id IS NULL OR tx_id = '') AND (flag IS NULL OR flag NOT LIKE '%ignore%');
   CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
   );
 `);
+
+// Safe migrations for pre-existing databases
+try { db.exec(`ALTER TABLE receipts ADD COLUMN image TEXT;`); } catch (e) {}
+try { db.exec(`ALTER TABLE receipts ADD COLUMN collection_id TEXT;`); } catch (e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_receipts_tx_id_transfer ON receipts(tx_id_transfer);`); } catch (e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_receipts_date_created ON receipts(date DESC, created DESC);`); } catch (e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_receipts_unlinked ON receipts(date DESC, created DESC) WHERE (tx_id IS NULL OR tx_id = '') AND (flag IS NULL OR flag NOT LIKE '%ignore%');`); } catch (e) {}
+
+// Pre-compiled prepared statements
+let _upsertStmt = null;
+function getUpsertStmt() {
+  if (!_upsertStmt) {
+    _upsertStmt = db.prepare(`
+      INSERT OR REPLACE INTO receipts (
+        id, tx_id, tx_id_transfer, date, amount, payee, source, source_ref, source_hash, lines, parsed, flag, image, collection_id, created, updated
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      )
+    `);
+  }
+  return _upsertStmt;
+}
 
 // ─── Auth State ───
 let cachedToken = null;
@@ -178,6 +212,17 @@ function normalizeReceiptRecord(r) {
     parsedStr = JSON.stringify(r.parsed);
   }
 
+  let imageStr = "[]";
+  if (typeof r.image === "string") {
+    if (r.image.startsWith("[")) {
+      imageStr = r.image;
+    } else if (r.image.trim()) {
+      imageStr = JSON.stringify([r.image.trim()]);
+    }
+  } else if (Array.isArray(r.image)) {
+    imageStr = JSON.stringify(r.image);
+  }
+
   let flagStr = "";
   if (Array.isArray(r.flag)) {
     flagStr = r.flag.join(", ");
@@ -203,6 +248,8 @@ function normalizeReceiptRecord(r) {
     lines: linesStr,
     parsed: parsedStr,
     flag: flagStr,
+    image: imageStr,
+    collection_id: r.collectionId || r.collection_id || "pbc_1571142587",
     created: r.created || "",
     updated: r.updated || "",
   };
@@ -210,13 +257,7 @@ function normalizeReceiptRecord(r) {
 
 function upsertReceiptSqlite(rec) {
   const norm = normalizeReceiptRecord(rec);
-  const stmt = db.prepare(`
-    INSERT OR REPLACE INTO receipts (
-      id, tx_id, tx_id_transfer, date, amount, payee, source, source_ref, source_hash, lines, parsed, flag, created, updated
-    ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-    )
-  `);
+  const stmt = getUpsertStmt();
   stmt.run(
     norm.id,
     norm.tx_id,
@@ -230,28 +271,34 @@ function upsertReceiptSqlite(rec) {
     norm.lines,
     norm.parsed,
     norm.flag,
+    norm.image,
+    norm.collection_id,
     norm.created,
     norm.updated
   );
 }
 
-// ─── Sync All Receipts into SQLite ───
+// ─── Sync Receipts into SQLite (Full or Incremental) ───
 export async function syncReceipts(options = {}) {
   const startTime = Date.now();
   let page = 1;
   const perPage = options.perPage || 500;
   let totalSaved = 0;
+  const isFull = !!options.full;
 
+  let filter = options.filter || "";
+  if (!filter && !isFull) {
+    const metaRow = db.prepare("SELECT value FROM meta WHERE key = 'last_sync'").get();
+    if (metaRow && metaRow.value) {
+      const dateFormatted = metaRow.value.replace("T", " ").slice(0, 19);
+      filter = `updated > "${dateFormatted}"`;
+    }
+  }
+
+  const stmt = getUpsertStmt();
   const insertMany = (records) => {
     db.exec("BEGIN TRANSACTION;");
     try {
-      const stmt = db.prepare(`
-        INSERT OR REPLACE INTO receipts (
-          id, tx_id, tx_id_transfer, date, amount, payee, source, source_ref, source_hash, lines, parsed, flag, created, updated
-        ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-      `);
       for (const r of records) {
         const norm = normalizeReceiptRecord(r);
         stmt.run(
@@ -267,6 +314,8 @@ export async function syncReceipts(options = {}) {
           norm.lines,
           norm.parsed,
           norm.flag,
+          norm.image,
+          norm.collection_id,
           norm.created,
           norm.updated
         );
@@ -284,8 +333,8 @@ export async function syncReceipts(options = {}) {
       perPage: String(perPage),
       skipTotal: "true",
     });
-    if (options.filter) {
-      queryParams.set("filter", options.filter);
+    if (filter) {
+      queryParams.set("filter", filter);
     }
 
     const res = await pbRequest(`/api/collections/receipts/records?${queryParams.toString()}`);
@@ -305,10 +354,15 @@ export async function syncReceipts(options = {}) {
   const updateMeta = db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_sync', ?)");
   updateMeta.run(new Date().toISOString());
 
+  // Checkpoint WAL passively after sync
+  try { db.exec(`PRAGMA wal_checkpoint(PASSIVE);`); } catch (e) {}
+
   return {
     success: true,
     totalSaved,
     pages: page,
+    filterUsed: filter || null,
+    isFull,
     durationMs,
   };
 }
@@ -337,25 +391,25 @@ export function checkReceiptExists({ source_hash, source_ref, tx_id, active_only
   }
 
   if (tx_id) {
-    let sql = "SELECT 1 FROM receipts WHERE tx_id = ?";
+    let sql = "SELECT 1 FROM receipts WHERE tx_id = ? OR tx_id_transfer = ?";
     if (active_only) {
       sql += " AND (flag IS NULL OR flag NOT LIKE '%ignore%')";
     }
     const stmt = db.prepare(sql);
-    const row = stmt.get(tx_id);
+    const row = stmt.get(tx_id, tx_id);
     if (row) return true;
   }
 
   return false;
 }
 
-// ─── Get Single Receipt ───
+// ─── Get Single Receipt (with remote fallback) ───
 export async function getReceipt({ id, tx_id, source_hash, source_ref }) {
   let row = null;
   if (id) {
     row = db.prepare("SELECT * FROM receipts WHERE id = ?").get(id);
   } else if (tx_id) {
-    row = db.prepare("SELECT * FROM receipts WHERE tx_id = ? ORDER BY date DESC LIMIT 1").get(tx_id);
+    row = db.prepare("SELECT * FROM receipts WHERE tx_id = ? OR tx_id_transfer = ? ORDER BY date DESC LIMIT 1").get(tx_id, tx_id);
   } else if (source_hash) {
     row = db.prepare("SELECT * FROM receipts WHERE source_hash = ? LIMIT 1").get(source_hash);
   } else if (source_ref) {
@@ -363,21 +417,116 @@ export async function getReceipt({ id, tx_id, source_hash, source_ref }) {
     row = db.prepare("SELECT * FROM receipts WHERE source_ref = ? OR source_ref = ? LIMIT 1").get(source_ref, cleanRef);
   }
 
-  if (!row && id) {
+  // Remote fallback if not found locally
+  if (!row) {
     try {
-      const remote = await pbRequest(`/api/collections/receipts/records/${encodeURIComponent(id)}`);
+      let remote = null;
+      if (id) {
+        remote = await pbRequest(`/api/collections/receipts/records/${encodeURIComponent(id)}`);
+      } else if (source_hash) {
+        const safeHash = String(source_hash).replace(/'/g, "\\'");
+        const res = await pbRequest(`/api/collections/receipts/records?filter=${encodeURIComponent(`source_hash='${safeHash}'`)}&perPage=1&skipTotal=true`);
+        if (res.items && res.items.length > 0) remote = res.items[0];
+      } else if (source_ref) {
+        const cleanRef = source_ref.includes("/") ? source_ref.split("/").pop() : source_ref;
+        const safeRef = String(source_ref).replace(/'/g, "\\'");
+        const safeClean = String(cleanRef).replace(/'/g, "\\'");
+        const res = await pbRequest(`/api/collections/receipts/records?filter=${encodeURIComponent(`source_ref='${safeRef}' || source_ref='${safeClean}'`)}&perPage=1&skipTotal=true`);
+        if (res.items && res.items.length > 0) remote = res.items[0];
+      } else if (tx_id) {
+        const safeTx = String(tx_id).replace(/'/g, "\\'");
+        const res = await pbRequest(`/api/collections/receipts/records?filter=${encodeURIComponent(`tx_id='${safeTx}' || tx_id_transfer='${safeTx}'`)}&perPage=1&skipTotal=true`);
+        if (res.items && res.items.length > 0) remote = res.items[0];
+      }
+
       if (remote) {
         upsertReceiptSqlite(remote);
-        row = db.prepare("SELECT * FROM receipts WHERE id = ?").get(id);
+        row = db.prepare("SELECT * FROM receipts WHERE id = ?").get(remote.id);
       }
     } catch (e) {
-      // not found
+      // Not found or network error
     }
   }
 
   if (!row) return null;
-
   return formatReceiptOutput(row);
+}
+
+// ─── Get Receipt Image (Remote Streamable Tool) ───
+export async function getReceiptImage({ id, filename, page_index = 0 }) {
+  if (!id) {
+    throw new Error("Receipt ID is required");
+  }
+
+  let row = db.prepare("SELECT id, image, collection_id FROM receipts WHERE id = ?").get(id);
+  if (!row) {
+    try {
+      const remote = await pbRequest(`/api/collections/receipts/records/${encodeURIComponent(id)}`);
+      if (remote) {
+        upsertReceiptSqlite(remote);
+        row = db.prepare("SELECT id, image, collection_id FROM receipts WHERE id = ?").get(id);
+      }
+    } catch (e) {}
+  }
+
+  if (!row) {
+    return { found: false, message: `Receipt with ID "${id}" not found` };
+  }
+
+  let images = [];
+  try {
+    images = row.image ? (typeof row.image === "string" && row.image.startsWith("[") ? JSON.parse(row.image) : [row.image]) : [];
+  } catch (e) {
+    images = [];
+  }
+
+  let targetFilename = filename;
+  if (!targetFilename) {
+    if (images.length === 0) {
+      return { found: false, id, message: "Receipt record has no attached images" };
+    }
+    const idx = Math.min(Math.max(0, page_index || 0), images.length - 1);
+    targetFilename = images[idx];
+  }
+
+  const collId = row.collection_id || "pbc_1571142587";
+  const fileUrl = `${PB_BASE_URL}/api/files/${collId}/${row.id}/${targetFilename}`;
+
+  const token = await getAuthToken();
+  const headers = {};
+  if (token) {
+    if (token === PB_API_TOKEN) {
+      headers["x-api-token"] = token;
+    } else {
+      headers["Authorization"] = token;
+    }
+  }
+
+  const res = await fetch(fileUrl, { headers });
+  if (!res.ok) {
+    return {
+      found: false,
+      id,
+      filename: targetFilename,
+      url: fileUrl,
+      message: `Failed to download image: HTTP ${res.status} ${res.statusText}`,
+    };
+  }
+
+  const contentType = res.headers.get("content-type") || "image/jpeg";
+  const arrayBuffer = await res.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const dataBase64 = buffer.toString("base64");
+
+  return {
+    found: true,
+    id,
+    filename: targetFilename,
+    mime_type: contentType,
+    size_bytes: buffer.byteLength,
+    data_base64: dataBase64,
+    url: fileUrl,
+  };
 }
 
 function formatReceiptOutput(row) {
@@ -395,10 +544,22 @@ function formatReceiptOutput(row) {
     parsed = row.parsed;
   }
 
+  let images = [];
+  try {
+    images = row.image ? (typeof row.image === "string" && row.image.startsWith("[") ? JSON.parse(row.image) : [row.image]) : [];
+  } catch (e) {
+    images = [];
+  }
+
+  const collId = row.collection_id || "pbc_1571142587";
+  const image_urls = (images || []).map(img => `${PB_BASE_URL}/api/files/${collId}/${row.id}/${img}`);
+
   return {
     ...row,
     lines,
     parsed,
+    image: images,
+    image_urls,
   };
 }
 
@@ -408,8 +569,8 @@ export function listReceipts(opts = {}) {
   const params = [];
 
   if (opts.tx_id) {
-    conditions.push("tx_id = ?");
-    params.push(opts.tx_id);
+    conditions.push("(tx_id = ? OR tx_id_transfer = ?)");
+    params.push(opts.tx_id, opts.tx_id);
   }
 
   if (opts.tx_ids) {
@@ -417,9 +578,14 @@ export function listReceipts(opts = {}) {
       ? opts.tx_ids
       : opts.tx_ids.split(",").map((s) => s.trim()).filter(Boolean);
     if (ids.length > 0) {
-      conditions.push(`tx_id IN (${ids.map(() => "?").join(", ")})`);
-      params.push(...ids);
+      const placeholders = ids.map(() => "?").join(", ");
+      conditions.push(`(tx_id IN (${placeholders}) OR tx_id_transfer IN (${placeholders}))`);
+      params.push(...ids, ...ids);
     }
+  }
+
+  if (opts.unlinked_only || opts["unlinked-only"]) {
+    conditions.push("(tx_id IS NULL OR tx_id = '')");
   }
 
   if (opts.date) {
@@ -457,6 +623,11 @@ export function listReceipts(opts = {}) {
     params.push(`%${opts.payee}%`);
   }
 
+  if (opts.search) {
+    conditions.push("(payee LIKE ? OR source_ref LIKE ? OR lines LIKE ? OR parsed LIKE ?)");
+    params.push(`%${opts.search}%`, `%${opts.search}%`, `%${opts.search}%`, `%${opts.search}%`);
+  }
+
   if (opts.exclude_ignored || opts.active_only) {
     conditions.push("(flag IS NULL OR flag NOT LIKE '%ignore%')");
   }
@@ -477,7 +648,7 @@ export function listReceipts(opts = {}) {
 
 // ─── Save / Upsert Receipt ───
 export async function saveReceipt(data) {
-  let existingId = data.id || null;
+  let existingId = data.id || data.receipt_id || null;
 
   // 1. Search existing from local SQLite cache first (O(1) local check)
   if (!existingId && data.source_hash) {
@@ -493,10 +664,15 @@ export async function saveReceipt(data) {
   // 2. Fallback to remote PocketBase search if not in local cache
   if (!existingId && (data.source_hash || data.source_ref)) {
     const filters = [];
-    if (data.source_hash) filters.push(`source_hash='${data.source_hash}'`);
+    if (data.source_hash) {
+      const safeHash = String(data.source_hash).replace(/'/g, "\\'");
+      filters.push(`source_hash='${safeHash}'`);
+    }
     if (data.source_ref) {
       const cleanRef = data.source_ref.includes("/") ? data.source_ref.split("/").pop() : data.source_ref;
-      filters.push(`source_ref='${data.source_ref}' || source_ref='${cleanRef}'`);
+      const safeRef = String(data.source_ref).replace(/'/g, "\\'");
+      const safeClean = String(cleanRef).replace(/'/g, "\\'");
+      filters.push(`source_ref='${safeRef}' || source_ref='${safeClean}'`);
     }
     try {
       const searchRes = await pbRequest(`/api/collections/receipts/records?filter=${encodeURIComponent(filters.join(" || "))}&perPage=1&skipTotal=true`);
@@ -542,23 +718,64 @@ export async function saveReceipt(data) {
     if (pbPayload.source_hash === undefined) pbPayload.source_hash = "";
   }
 
-  const imagePaths = Array.isArray(data.image_paths) ? data.image_paths : [];
+  // Check for file uploads: supports local paths (`image_paths`) and base64 images (`images`)
+  const hasImagePaths = data.image_paths && Array.isArray(data.image_paths) && data.image_paths.length > 0;
+  const hasBase64Images = data.images && Array.isArray(data.images) && data.images.length > 0;
+  const hasSingleBase64 = data.image_base64 || (data.image && typeof data.image === "object" && data.image.data_base64);
+
   let requestBody;
-  if (imagePaths.length > 0) {
+  if (hasImagePaths || hasBase64Images || hasSingleBase64) {
     const formData = new FormData();
     for (const [k, v] of Object.entries(pbPayload)) {
       if (v !== undefined && v !== null) {
         formData.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
       }
     }
-    for (let i = 0; i < imagePaths.length; i++) {
-      const p = imagePaths[i];
-      if (fs.existsSync(p)) {
-        const fileBytes = fs.readFileSync(p);
-        const blob = new Blob([fileBytes], { type: "image/jpeg" });
-        formData.append("image", blob, `page_${i}.jpg`);
+
+    const mimeTypes = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".webp": "image/webp",
+      ".pdf": "application/pdf",
+      ".gif": "image/gif",
+    };
+
+    if (hasImagePaths) {
+      for (let i = 0; i < data.image_paths.length; i++) {
+        const p = data.image_paths[i];
+        if (fs.existsSync(p)) {
+          const fileBytes = fs.readFileSync(p);
+          const ext = path.extname(p).toLowerCase();
+          const mimeType = mimeTypes[ext] || "image/jpeg";
+          const blob = new Blob([fileBytes], { type: mimeType });
+          formData.append("image", blob, path.basename(p));
+        }
       }
     }
+
+    if (hasBase64Images) {
+      for (let i = 0; i < data.images.length; i++) {
+        const item = data.images[i];
+        if (item && item.data_base64) {
+          const buffer = Buffer.from(item.data_base64, "base64");
+          const mimeType = item.mime_type || "image/jpeg";
+          const filename = item.filename || `receipt_${i}.${mimeType.split("/")[1] || "jpg"}`;
+          const blob = new Blob([buffer], { type: mimeType });
+          formData.append("image", blob, filename);
+        }
+      }
+    }
+
+    if (hasSingleBase64) {
+      const b64 = typeof hasSingleBase64 === "string" ? hasSingleBase64 : hasSingleBase64.data_base64;
+      const mime = (typeof hasSingleBase64 === "object" && hasSingleBase64.mime_type) || "image/jpeg";
+      const fname = (typeof hasSingleBase64 === "object" && hasSingleBase64.filename) || `receipt.${mime.split("/")[1] || "jpg"}`;
+      const buffer = Buffer.from(b64, "base64");
+      const blob = new Blob([buffer], { type: mime });
+      formData.append("image", blob, fname);
+    }
+
     requestBody = formData;
   } else {
     requestBody = JSON.stringify(pbPayload);
@@ -579,6 +796,28 @@ export async function saveReceipt(data) {
 
   upsertReceiptSqlite(result);
   return formatReceiptOutput(result);
+}
+
+// ─── Direct Linking & Unlinking Helpers ───
+export async function linkReceipt({ receipt_id, tx_id, tx_id_transfer }) {
+  if (!receipt_id) throw new Error("receipt_id is required");
+  if (!tx_id) throw new Error("tx_id is required");
+
+  return await saveReceipt({
+    id: receipt_id,
+    tx_id,
+    tx_id_transfer: tx_id_transfer || "",
+  });
+}
+
+export async function unlinkReceipt({ receipt_id }) {
+  if (!receipt_id) throw new Error("receipt_id is required");
+
+  return await saveReceipt({
+    id: receipt_id,
+    tx_id: "",
+    tx_id_transfer: "",
+  });
 }
 
 // ─── Delete Receipt ───
@@ -611,7 +850,7 @@ export async function deleteReceipt({ id, source_hash, tx_id }) {
 
 const VALID_RECEIPT_COLUMNS = new Set([
   "id", "tx_id", "tx_id_transfer", "date", "amount", "payee", "source",
-  "source_ref", "source_hash", "lines", "parsed", "flag", "created", "updated"
+  "source_ref", "source_hash", "lines", "parsed", "flag", "image", "collection_id", "created", "updated"
 ]);
 
 // ─── ActualQL Query Translator for Receipts Table ───
@@ -625,8 +864,6 @@ export function queryReceipts(opts = {}) {
     const selectedCols = fields.map(f => {
       if (VALID_RECEIPT_COLUMNS.has(f)) {
         return `\`${f}\``;
-      } else if (f === "image") {
-        return "NULL as `image`";
       } else {
         return `NULL as \`${f}\``;
       }
@@ -647,7 +884,7 @@ export function queryReceipts(opts = {}) {
   if (opts.order_by) {
     orderSql = `ORDER BY ${opts.order_by}`;
   } else {
-    orderSql = `ORDER BY date DESC`;
+    orderSql = `ORDER BY date DESC, created DESC`;
   }
 
   let limitSql = "";
@@ -661,19 +898,10 @@ export function queryReceipts(opts = {}) {
   const sql = `SELECT ${selectClause} FROM receipts ${whereSql} ${orderSql} ${limitSql}`;
   const rows = db.prepare(sql).all(...params);
 
-  return rows.map((row) => {
-    const formatted = { ...row };
-    if ("lines" in formatted && typeof formatted.lines === "string") {
-      try { formatted.lines = JSON.parse(formatted.lines); } catch (e) {}
-    }
-    if ("parsed" in formatted && typeof formatted.parsed === "string") {
-      try { formatted.parsed = JSON.parse(formatted.parsed); } catch (e) {}
-    }
-    return formatted;
-  });
+  return rows.map(formatReceiptOutput);
 }
 
-function parsePbFilterString(filterStr) {
+export function parsePbFilterString(filterStr) {
   if (!filterStr || typeof filterStr !== "string") return { whereClause: "", params: [] };
   const orClauses = [];
   const params = [];
@@ -683,15 +911,38 @@ function parsePbFilterString(filterStr) {
     const andParts = orPart.split("&&").map(s => s.trim()).filter(Boolean);
     const andClauses = [];
     for (const term of andParts) {
-      const match = term.match(/^([a-zA-Z0-9_]+)\s*(=|!=|~|!~)\s*['"]?(.*?)['"]?$/);
+      // Support all comparison operators: >=, <=, !=, !~, =, <, >, ~
+      const match = term.match(/^([a-zA-Z0-9_]+)\s*(>=|<=|!=|!~|=|<|>|~)\s*['"]?(.*?)['"]?$/);
       if (match) {
         const [, field, op, rawVal] = match;
-        const val = rawVal.replace(/^['"]|['"]$/g, "");
+        const val = rawVal.replace(/^['"]|['"]$/g, "").trim();
+        const isNullCheck = val === "null" || val === "" || val.toLowerCase() === "null";
+
         if (op === "=") {
-          andClauses.push(`\`${field}\` = ?`);
-          params.push(val);
+          if (isNullCheck) {
+            andClauses.push(`(\`${field}\` IS NULL OR \`${field}\` = '')`);
+          } else {
+            andClauses.push(`\`${field}\` = ?`);
+            params.push(val);
+          }
         } else if (op === "!=") {
-          andClauses.push(`\`${field}\` != ?`);
+          if (isNullCheck) {
+            andClauses.push(`(\`${field}\` IS NOT NULL AND \`${field}\` != '')`);
+          } else {
+            andClauses.push(`(\`${field}\` != ? OR \`${field}\` IS NULL)`);
+            params.push(val);
+          }
+        } else if (op === ">=") {
+          andClauses.push(`\`${field}\` >= ?`);
+          params.push(val);
+        } else if (op === "<=") {
+          andClauses.push(`\`${field}\` <= ?`);
+          params.push(val);
+        } else if (op === ">") {
+          andClauses.push(`\`${field}\` > ?`);
+          params.push(val);
+        } else if (op === "<") {
+          andClauses.push(`\`${field}\` < ?`);
           params.push(val);
         } else if (op === "~") {
           andClauses.push(`\`${field}\` LIKE ?`);
@@ -763,14 +1014,22 @@ function buildWhereClause(filter) {
         clauses.push(`(${subClauses.join(" OR ")})`);
       }
     } else if (typeof val === "object" && val !== null && !Array.isArray(val)) {
-      // Comparison operators
       for (const [op, opVal] of Object.entries(val)) {
+        const isNullCheck = opVal === null || opVal === "" || opVal === "null";
         if (op === "$eq") {
-          clauses.push(`\`${key}\` = ?`);
-          params.push(opVal);
+          if (isNullCheck) {
+            clauses.push(`(\`${key}\` IS NULL OR \`${key}\` = '')`);
+          } else {
+            clauses.push(`\`${key}\` = ?`);
+            params.push(opVal);
+          }
         } else if (op === "$ne") {
-          clauses.push(`\`${key}\` != ?`);
-          params.push(opVal);
+          if (isNullCheck) {
+            clauses.push(`(\`${key}\` IS NOT NULL AND \`${key}\` != '')`);
+          } else {
+            clauses.push(`(\`${key}\` != ? OR \`${key}\` IS NULL)`);
+            params.push(opVal);
+          }
         } else if (op === "$gt") {
           clauses.push(`\`${key}\` > ?`);
           params.push(opVal);
@@ -792,9 +1051,12 @@ function buildWhereClause(filter) {
         }
       }
     } else {
-      // Simple equality
-      clauses.push(`\`${key}\` = ?`);
-      params.push(val);
+      if (val === null || val === "" || val === "null") {
+        clauses.push(`(\`${key}\` IS NULL OR \`${key}\` = '')`);
+      } else {
+        clauses.push(`\`${key}\` = ?`);
+        params.push(val);
+      }
     }
   }
 
@@ -802,6 +1064,113 @@ function buildWhereClause(filter) {
     whereClause: clauses.join(" AND "),
     params,
   };
+}
+
+// ─── Real-Time SSE Synchronization with PocketBase ───
+let realtimeAbortController = null;
+let realtimeReconnectTimer = null;
+
+export async function startRealtimeListener() {
+  if (realtimeAbortController) {
+    try { realtimeAbortController.abort(); } catch (e) {}
+  }
+  realtimeAbortController = new AbortController();
+  const { signal } = realtimeAbortController;
+
+  const connect = async () => {
+    if (signal.aborted) return;
+    try {
+      const token = await getAuthToken();
+      const headers = {};
+      if (token) {
+        if (token === PB_API_TOKEN) {
+          headers["x-api-token"] = token;
+        } else {
+          headers["Authorization"] = token;
+        }
+      }
+
+      const res = await fetch(`${PB_BASE_URL}/api/realtime`, {
+        headers,
+        signal,
+      });
+
+      if (!res.ok || !res.body) {
+        throw new Error(`Realtime connection failed: HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let clientId = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+
+        for (const rawEvent of parts) {
+          const trimmed = rawEvent.trim();
+          if (!trimmed) continue;
+
+          const lines = trimmed.split("\n");
+          let eventType = "message";
+          let eventData = "";
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) {
+              eventType = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              eventData += line.slice(5).trim();
+            }
+          }
+
+          if (eventType === "PB_CONNECT") {
+            try {
+              const parsed = JSON.parse(eventData);
+              clientId = parsed.clientId;
+              // Subscribe to receipts collection
+              await fetch(`${PB_BASE_URL}/api/realtime`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", ...headers },
+                body: JSON.stringify({ clientId, subscriptions: ["receipts/*"] }),
+                signal,
+              });
+              console.error(`[PocketBase Realtime] Subscribed to receipts/* (clientId: ${clientId})`);
+            } catch (subErr) {
+              console.error(`[PocketBase Realtime] Subscription error: ${subErr.message}`);
+            }
+          } else if (eventData) {
+            try {
+              const payload = JSON.parse(eventData);
+              if (payload.action && payload.record) {
+                const action = payload.action;
+                const rec = payload.record;
+                if (action === "create" || action === "update") {
+                  upsertReceiptSqlite(rec);
+                  console.error(`[PocketBase Realtime] ${action} cached record ${rec.id}`);
+                } else if (action === "delete") {
+                  db.prepare("DELETE FROM receipts WHERE id = ?").run(rec.id);
+                  console.error(`[PocketBase Realtime] deleted cached record ${rec.id}`);
+                }
+              }
+            } catch (parseErr) {
+              // Ignore malformed event
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if (!signal.aborted) {
+        console.error(`[PocketBase Realtime] Stream disconnected (${err.message}), reconnecting in 5s...`);
+        realtimeReconnectTimer = setTimeout(connect, 5000);
+      }
+    }
+  };
+
+  connect();
 }
 
 // ─── CLI Command Handler for receipts ───
@@ -818,6 +1187,22 @@ export async function handleReceipts(subCmd, opts) {
         source_hash: opts["source-hash"] || opts.source_hash,
         source_ref: opts["source-ref"] || opts.source_ref,
       });
+    }
+    case "image": {
+      const id = opts._positional && opts._positional[0] ? opts._positional[0] : opts.id;
+      const filename = opts.filename;
+      const pageIndex = opts["page-index"] !== undefined ? parseInt(opts["page-index"], 10) : (opts.page_index !== undefined ? parseInt(opts.page_index, 10) : 0);
+      return await getReceiptImage({ id, filename, page_index: pageIndex });
+    }
+    case "link": {
+      const receipt_id = opts._positional && opts._positional[0] ? opts._positional[0] : (opts.receipt_id || opts.id);
+      const tx_id = opts["tx-id"] || opts.tx_id;
+      const tx_id_transfer = opts["tx-id-transfer"] || opts.tx_id_transfer;
+      return await linkReceipt({ receipt_id, tx_id, tx_id_transfer });
+    }
+    case "unlink": {
+      const receipt_id = opts._positional && opts._positional[0] ? opts._positional[0] : (opts.receipt_id || opts.id);
+      return await unlinkReceipt({ receipt_id });
     }
     case "exists": {
       return {
@@ -849,19 +1234,40 @@ export async function handleReceipts(subCmd, opts) {
       return await syncReceipts({ full: !!opts.full });
     }
     default:
-      throw new Error(`Unknown receipts subcommand: "${subCmd}". Available: list, get, exists, save, delete, sync`);
+      throw new Error(`Unknown receipts subcommand: "${subCmd}". Available: list, get, image, link, unlink, exists, save, delete, sync`);
   }
 }
 
-// Check if initial sync is needed on import
+// Start real-time SSE listener in background
+startRealtimeListener().catch((err) => {
+  console.error(`[PocketBase Realtime] Init error: ${err.message}`);
+});
+
+// Periodic incremental sync every 15 minutes as safety net
+setInterval(() => {
+  syncReceipts({ incremental: true }).catch((err) => {
+    console.error(`[PocketBase Background Sync] Error: ${err.message}`);
+  });
+}, 15 * 60 * 1000);
+
+// Check if initial sync or migration sync is needed on import
 (async () => {
   try {
     const row = db.prepare("SELECT COUNT(*) as count FROM receipts").get();
     if (!row || row.count === 0) {
       console.error("[PocketBase] Local cache empty, triggering initial sync...");
-      syncReceipts().catch((err) => {
+      syncReceipts({ full: true }).catch((err) => {
         console.error(`[PocketBase] Background sync error: ${err.message}`);
       });
+    } else {
+      // Check if image column is populated; if not, trigger a background full sync to backfill images
+      const imgRow = db.prepare("SELECT 1 FROM receipts WHERE image IS NOT NULL AND image != '[]' AND image != '' LIMIT 1").get();
+      if (!imgRow) {
+        console.error("[PocketBase] Image column unpopulated, triggering one-time background full sync...");
+        syncReceipts({ full: true }).catch((err) => {
+          console.error(`[PocketBase] Background migration sync error: ${err.message}`);
+        });
+      }
     }
   } catch (e) {
     // Ignore
