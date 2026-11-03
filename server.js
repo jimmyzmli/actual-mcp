@@ -41,6 +41,7 @@ import {
   PID_LOG_FILE,
   COMMAND_LOG_FILE,
 } from "./logger.js";
+import { handleReceipts, queryReceipts } from "./pocketbase.js";
 
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -661,6 +662,22 @@ const TABLE_SCHEMA = {
     rule: { type: 'id', ref: 'rules' },
     next_date: { type: 'date' },
     completed: { type: 'boolean' },
+  },
+  receipts: {
+    id: { type: 'id' },
+    tx_id: { type: 'id', ref: 'transactions' },
+    tx_id_transfer: { type: 'id', ref: 'transactions' },
+    date: { type: 'date' },
+    amount: { type: 'float' },
+    payee: { type: 'string' },
+    source: { type: 'string' },
+    source_ref: { type: 'string' },
+    source_hash: { type: 'string' },
+    lines: { type: 'json' },
+    parsed: { type: 'json' },
+    flag: { type: 'string' },
+    created: { type: 'string' },
+    updated: { type: 'string' },
   },
 };
 
@@ -1385,6 +1402,9 @@ async function handleQuery(subCmd, opts) {
       }));
     }
     case 'run': {
+      if (opts.table === 'receipts') {
+        return queryReceipts(opts);
+      }
       await ensureBudget();
       let queryObj;
       if (opts.file || opts.data) {
@@ -1453,6 +1473,7 @@ const COMMAND_HANDLERS = {
   sync: handleSync,
   query: handleQuery,
   server: handleServer,
+  receipts: handleReceipts,
 };
 
 async function executeCommand(cliArgs, explicitClientId = null) {
@@ -1599,6 +1620,17 @@ const COMMAND_SCHEMAS = {
       "- get-id --type <type> --name <name>\n" +
       "- bank-sync [--account <id>]",
     rules: "Rules:\n- `get-id` requires `--type` (e.g. 'accounts') and `--name`."
+  },
+  receipts: {
+    desc: "Manage and query receipts (PocketBase backed with local SQLite cache).",
+    details: "Subcommands:\n" +
+      "- list [--tx-id <id>] [--tx-ids <id1,id2>] [--date <YYYY-MM-DD>] [--start <YYYY-MM-DD>] [--end <YYYY-MM-DD>] [--source <src>] [--source-ref <ref>] [--source-hash <hash>] [--payee <name>] [--limit <n>] [--offset <n>]\n" +
+      "- get <id> [--tx-id <id>] [--source-hash <hash>] [--source-ref <ref>]\n" +
+      "- exists [--source-hash <hash>] [--source-ref <ref>] [--tx-id <id>] [--active-only]\n" +
+      "- save (--data <json> | --file <path>)\n" +
+      "- delete <id> [--source-hash <hash>] [--tx-id <id>]\n" +
+      "- sync [--full]",
+    rules: "Rules:\n- Backed by PocketBase with automatic fast local SQLite caching.\n- Supports querying receipts as an integrated ActualQL table via `query run --table receipts`."
   }
 };
 
@@ -1936,6 +1968,94 @@ export const MCP_TOOL_DEFINITIONS = [
       }
     },
     toCli: (input = {}) => ["sync", "--status", ...(input.args || [])]
+  },
+  {
+    name: "actual_list_receipts",
+    readOnly: true,
+    description: "[READ-ONLY] List receipts stored in PocketBase (cached locally in SQLite for fast lookup). Supports filtering by tx_id, date, source, payee, etc.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tx_id: { type: "string", description: "Filter by Actual Budget transaction ID" },
+        tx_ids: { type: "array", items: { type: "string" }, description: "Filter by multiple transaction IDs" },
+        date: { type: "string", description: "Exact date (YYYY-MM-DD)" },
+        start: { type: "string", description: "Start date (YYYY-MM-DD)" },
+        end: { type: "string", description: "End date (YYYY-MM-DD)" },
+        source: { type: "string", description: "Source type (e.g. file, email, paperless, icloud)" },
+        source_ref: { type: "string", description: "Source reference (e.g. filename, email message ID)" },
+        source_hash: { type: "string", description: "SHA-256 hash of receipt source" },
+        payee: { type: "string", description: "Payee name search" },
+        limit: { type: "integer", description: "Maximum rows to return (default: 100)" },
+        offset: { type: "integer", description: "Offset for pagination" },
+        active_only: { type: "boolean", description: "Exclude ignored receipts" },
+        args: { type: "array", items: { type: "string" }, description: "CLI arguments" }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "list", ...input.args];
+      const cli = ["receipts", "list"];
+      if (input.tx_id) cli.push("--tx-id", input.tx_id);
+      if (input.tx_ids) cli.push("--tx-ids", Array.isArray(input.tx_ids) ? input.tx_ids.join(",") : input.tx_ids);
+      if (input.date) cli.push("--date", input.date);
+      if (input.start) cli.push("--start", input.start);
+      if (input.end) cli.push("--end", input.end);
+      if (input.source) cli.push("--source", input.source);
+      if (input.source_ref) cli.push("--source-ref", input.source_ref);
+      if (input.source_hash) cli.push("--source-hash", input.source_hash);
+      if (input.payee) cli.push("--payee", input.payee);
+      if (input.limit !== undefined) cli.push("--limit", String(input.limit));
+      if (input.offset !== undefined) cli.push("--offset", String(input.offset));
+      if (input.active_only) cli.push("--active-only");
+      return cli;
+    }
+  },
+  {
+    name: "actual_get_receipt",
+    readOnly: true,
+    description: "[READ-ONLY] Retrieve a specific receipt by record ID, transaction ID (tx_id), source_hash, or source_ref.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "PocketBase record ID" },
+        tx_id: { type: "string", description: "Actual Budget transaction ID" },
+        source_hash: { type: "string", description: "SHA-256 hash of receipt source" },
+        source_ref: { type: "string", description: "Source reference (filename or message ID)" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "get", ...input.args];
+      const cli = ["receipts", "get"];
+      if (input.id) cli.push(input.id);
+      if (input.tx_id) cli.push("--tx-id", input.tx_id);
+      if (input.source_hash) cli.push("--source-hash", input.source_hash);
+      if (input.source_ref) cli.push("--source-ref", input.source_ref);
+      return cli;
+    }
+  },
+  {
+    name: "actual_check_receipt_exists",
+    readOnly: true,
+    description: "[READ-ONLY] Check whether a receipt already exists in PocketBase by source_hash, source_ref, or tx_id (fast O(1) local SQLite check).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_hash: { type: "string", description: "SHA-256 hash" },
+        source_ref: { type: "string", description: "Source reference" },
+        tx_id: { type: "string", description: "Transaction ID" },
+        active_only: { type: "boolean", description: "Exclude ignored receipts" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "exists", ...input.args];
+      const cli = ["receipts", "exists"];
+      if (input.source_hash) cli.push("--source-hash", input.source_hash);
+      if (input.source_ref) cli.push("--source-ref", input.source_ref);
+      if (input.tx_id) cli.push("--tx-id", input.tx_id);
+      if (input.active_only) cli.push("--active-only");
+      return cli;
+    }
   },
 
   // ─── MUTATING TOOLS ───
@@ -2671,6 +2791,76 @@ export const MCP_TOOL_DEFINITIONS = [
       if (Array.isArray(input.args)) return ["server", "bank-sync", ...input.args];
       const cli = ["server", "bank-sync"];
       if (input.account) cli.push("--account", input.account);
+      return cli;
+    }
+  },
+  {
+    name: "actual_save_receipt",
+    readOnly: false,
+    description: "[MUTATING] Save or update a receipt in PocketBase and local cache, linking it to an Actual Budget transaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tx_id: { type: "string", description: "Actual Budget transaction UUID" },
+        tx_id_transfer: { type: "string", description: "Transfer transaction UUID" },
+        date: { type: "string", description: "Transaction date (YYYY-MM-DD)" },
+        amount: { type: "number", description: "Total amount in dollars" },
+        payee: { type: "string", description: "Payee / store name" },
+        source: { type: "string", description: "Source type (e.g. file, email, paperless)" },
+        source_ref: { type: "string", description: "Source reference (filename / msg_id)" },
+        source_hash: { type: "string", description: "Source file hash for dedup" },
+        lines: { type: ["array", "string"], description: "Extracted line items array or JSON string" },
+        parsed: { type: ["object", "string"], description: "Full parsed data object or JSON string" },
+        flag: { type: "string", description: "Flag or tags (e.g. ignore)" },
+        data: { type: ["object", "string"], description: "Full receipt payload" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "save", ...input.args];
+      const cli = ["receipts", "save"];
+      const payload = input.data ? (typeof input.data === 'string' ? input.data : JSON.stringify(input.data)) : JSON.stringify(input);
+      cli.push("--data", payload);
+      return cli;
+    }
+  },
+  {
+    name: "actual_delete_receipt",
+    readOnly: false,
+    description: "[MUTATING] Delete a receipt from PocketBase and local cache by ID or source_hash.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "PocketBase record ID" },
+        source_hash: { type: "string", description: "Source hash" },
+        tx_id: { type: "string", description: "Transaction ID" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "delete", ...input.args];
+      const cli = ["receipts", "delete"];
+      if (input.id) cli.push(input.id);
+      if (input.source_hash) cli.push("--source-hash", input.source_hash);
+      if (input.tx_id) cli.push("--tx-id", input.tx_id);
+      return cli;
+    }
+  },
+  {
+    name: "actual_sync_receipts",
+    readOnly: false,
+    description: "Sync all receipts from PocketBase into the local SQLite cache for fast bulk lookups.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        full: { type: "boolean", description: "Perform full sweep instead of incremental" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["receipts", "sync", ...input.args];
+      const cli = ["receipts", "sync"];
+      if (input.full) cli.push("--full");
       return cli;
     }
   },
