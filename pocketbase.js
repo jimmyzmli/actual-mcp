@@ -775,6 +775,9 @@ export async function saveReceipt(data) {
   if ("flag" in data) {
     pbPayload.flag = Array.isArray(data.flag) ? data.flag.join(", ") : data.flag;
   }
+  if ("image-" in data) {
+    pbPayload["image-"] = data["image-"];
+  }
 
   // If creating new record, set sensible defaults for required fields
   if (!existingId) {
@@ -789,12 +792,18 @@ export async function saveReceipt(data) {
   const hasImagePaths = data.image_paths && Array.isArray(data.image_paths) && data.image_paths.length > 0;
   const hasBase64Images = data.images && Array.isArray(data.images) && data.images.length > 0;
   const hasSingleBase64 = data.image_base64 || (data.image && typeof data.image === "object" && data.image.data_base64);
+  const hasImageDeletions = !!data["image-"];
 
   let requestBody;
-  if (hasImagePaths || hasBase64Images || hasSingleBase64) {
+  if (hasImagePaths || hasBase64Images || hasSingleBase64 || hasImageDeletions) {
     const formData = new FormData();
     for (const [k, v] of Object.entries(pbPayload)) {
-      if (v !== undefined && v !== null) {
+      if (k === "image-") {
+        const toDelete = Array.isArray(v) ? v : [v];
+        for (const f of toDelete) {
+          if (f) formData.append("image-", String(f));
+        }
+      } else if (v !== undefined && v !== null) {
         formData.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
       }
     }
@@ -808,39 +817,57 @@ export async function saveReceipt(data) {
       ".gif": "image/gif",
     };
 
+    const attachedFilenames = new Set();
+    let localPathsAttached = 0;
+
     if (hasImagePaths) {
       for (let i = 0; i < data.image_paths.length; i++) {
         const p = data.image_paths[i];
-        if (fs.existsSync(p)) {
+        if (p && typeof p === "string" && fs.existsSync(p)) {
           const fileBytes = fs.readFileSync(p);
           const ext = path.extname(p).toLowerCase();
           const mimeType = mimeTypes[ext] || "image/jpeg";
           const blob = new Blob([fileBytes], { type: mimeType });
-          formData.append("image", blob, path.basename(p));
+          const fname = path.basename(p);
+          if (!attachedFilenames.has(fname)) {
+            formData.append("image", blob, fname);
+            attachedFilenames.add(fname);
+            localPathsAttached++;
+          }
         }
       }
     }
 
-    if (hasBase64Images) {
+    // Only process base64 images if local paths did not satisfy all images,
+    // or to attach images not already attached by filename.
+    const allPathsSatisfied = hasImagePaths && localPathsAttached === data.image_paths.length && (!hasBase64Images || data.images.length <= localPathsAttached);
+
+    if (hasBase64Images && !allPathsSatisfied) {
       for (let i = 0; i < data.images.length; i++) {
         const item = data.images[i];
         if (item && item.data_base64) {
-          const buffer = Buffer.from(item.data_base64, "base64");
           const mimeType = item.mime_type || "image/jpeg";
           const filename = item.filename || `receipt_${i}.${mimeType.split("/")[1] || "jpg"}`;
-          const blob = new Blob([buffer], { type: mimeType });
-          formData.append("image", blob, filename);
+          if (!attachedFilenames.has(filename)) {
+            const buffer = Buffer.from(item.data_base64, "base64");
+            const blob = new Blob([buffer], { type: mimeType });
+            formData.append("image", blob, filename);
+            attachedFilenames.add(filename);
+          }
         }
       }
     }
 
-    if (hasSingleBase64) {
+    if (hasSingleBase64 && attachedFilenames.size === 0) {
       const b64 = typeof hasSingleBase64 === "string" ? hasSingleBase64 : hasSingleBase64.data_base64;
       const mime = (typeof hasSingleBase64 === "object" && hasSingleBase64.mime_type) || "image/jpeg";
       const fname = (typeof hasSingleBase64 === "object" && hasSingleBase64.filename) || `receipt.${mime.split("/")[1] || "jpg"}`;
-      const buffer = Buffer.from(b64, "base64");
-      const blob = new Blob([buffer], { type: mime });
-      formData.append("image", blob, fname);
+      if (!attachedFilenames.has(fname)) {
+        const buffer = Buffer.from(b64, "base64");
+        const blob = new Blob([buffer], { type: mime });
+        formData.append("image", blob, fname);
+        attachedFilenames.add(fname);
+      }
     }
 
     requestBody = formData;
