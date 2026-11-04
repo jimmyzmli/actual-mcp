@@ -3308,8 +3308,11 @@ async function run() {
   let isHealthy = true;
   const args = parseArgs(process.argv.slice(2));
 
-  if (args.port) {
-    const port = parseIntFlag(args.port, "port");
+  const rawPort = args.port || process.env.PORT;
+  if (rawPort) {
+    const port = parseIntFlag(rawPort, "port");
+    const rawHost = args.host || process.env.HOST || "127.0.0.1";
+    const hosts = [...new Set(String(rawHost).split(",").map(h => h.trim()).filter(Boolean))];
     const isAuthDisabled =
       args["no-auth"] === true || args["no-auth"] === "true" ||
       args["noauth"] === true || args["noauth"] === "true" ||
@@ -3493,15 +3496,22 @@ async function run() {
       });
     });
 
-    app.listen(port, () => {
-      console.error(`Actual Budget MCP server v2.0.0 running on port ${port} (StreamableHTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
-      if (enableAuth) {
-        console.error(`[OAuth] OAuth2 protection enabled (Client ID: ${OAUTH_CLIENT_ID})`);
-        console.error(`[OAuth] Discovery: http://localhost:${port}/.well-known/oauth-authorization-server`);
-      } else {
-        console.error(`[OAuth] OAuth2 protection disabled via flag`);
-      }
-    });
+    const activeServers = [];
+    for (const host of hosts) {
+      const serverInstance = app.listen(port, host, () => {
+        console.error(`Actual Budget MCP server v2.0.0 running on http://${host}:${port} (StreamableHTTP) (PID ${process.pid}, dataDir: ${INSTANCE_DATA_DIR})`);
+      });
+      serverInstance.on("error", (err) => {
+        console.error(`[Actual MCP] Warning: Failed to bind on ${host}:${port}: ${err.message}`);
+      });
+      activeServers.push(serverInstance);
+    }
+    if (enableAuth) {
+      console.error(`[OAuth] OAuth2 protection enabled (Client ID: ${OAUTH_CLIENT_ID})`);
+      console.error(`[OAuth] Discovery: http://localhost:${port}/.well-known/oauth-authorization-server`);
+    } else {
+      console.error(`[OAuth] OAuth2 protection disabled via flag`);
+    }
   } else {
     const server = createServer();
     const transport = new StdioServerTransport();
