@@ -4264,6 +4264,31 @@ async function run() {
               });
               return;
             }
+          } else if (sessionId && !transports.has(sessionId)) {
+            // Rehydrate StreamableHTTP session after server restart so existing clients continue working seamlessly
+            transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => sessionId,
+            });
+            if (!isInitializeRequest(req.body)) {
+              transport._webStandardTransport.sessionId = sessionId;
+              transport._webStandardTransport._initialized = true;
+            }
+            transports.set(sessionId, transport);
+            if (clientId) {
+              sessionClients.set(sessionId, clientId);
+            }
+            transport.onclose = () => {
+              const sid = transport.sessionId;
+              if (sid && transports.has(sid)) {
+                transports.delete(sid);
+                sessionClients.delete(sid);
+                console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
+              }
+            };
+            const server = createServer();
+            await server.connect(transport);
+            const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
+            console.error(`[StreamableHTTP] ${clientPrefix}Rehydrated session: ${sessionId} (${transports.size} active)`);
           } else if (!sessionId && req.method === 'GET' && (req.headers['accept']?.includes('text/event-stream') || req.path === '/sse')) {
             // Standalone SSE stream request (e.g. from IDE or older SSE clients)
             const sseTransport = new SSEServerTransport("/messages", res);
