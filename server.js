@@ -1121,7 +1121,7 @@ async function handleAccounts(subCmd, opts) {
       accounts.sort((a, b) => Number(a.offbudget) - Number(b.offbudget));
       const [balances, notesResult] = await Promise.all([
         Promise.all(accounts.map(a => api.getAccountBalance(a.id))),
-        api.aqlQuery(api.q('notes').filter({ id: { $like: 'account-%' } }).select(['id', 'note'])).catch(() => ({ data: [] })),
+        api.aqlQuery(api.q('notes').select(['id', 'note'])).catch(() => ({ data: [] })),
       ]);
       const noteMap = new Map();
       if (Array.isArray(notesResult?.data)) {
