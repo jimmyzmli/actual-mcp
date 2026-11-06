@@ -1,6 +1,7 @@
 node_modules
 *.sqlite
 data
+cache
 logs
 .env
 .env.*

@@ -48,11 +48,28 @@ const PB_PASSWORD = process.env.PB_PASSWORD || "t3xiKBWd6JpM3F";
 const PB_API_TOKEN = process.env.PB_API_TOKEN || "t9arjlT4M7oeg0JEeRD9fbnVNaC4T%9GOaA7AgFa4pnl@V9BaIh6*Mdz9IN7t9o#";
 
 // ─── Local SQLite Database Setup ───
-const DATA_DIR = path.join(__dirname, "data");
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+const CACHE_DIR = path.join(__dirname, "cache");
+if (!fs.existsSync(CACHE_DIR)) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
-const DB_PATH = path.join(DATA_DIR, "pocketbase.sqlite");
+const DB_PATH = path.join(CACHE_DIR, "pocketbase.sqlite");
+
+// Auto-migrate legacy data/pocketbase.sqlite to cache/pocketbase.sqlite if needed
+const LEGACY_DB_PATH = path.join(__dirname, "data", "pocketbase.sqlite");
+if (fs.existsSync(LEGACY_DB_PATH) && !fs.existsSync(DB_PATH)) {
+  try {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const src = LEGACY_DB_PATH + suffix;
+      const dst = DB_PATH + suffix;
+      if (fs.existsSync(src)) {
+        fs.renameSync(src, dst);
+      }
+    }
+    console.error("[PocketBase] Successfully migrated pocketbase.sqlite from data/ to cache/");
+  } catch (err) {
+    console.error(`[PocketBase] Failed to auto-migrate database from data/ to cache/: ${err.message}`);
+  }
+}
 
 const db = new DatabaseSync(DB_PATH);
 try {
