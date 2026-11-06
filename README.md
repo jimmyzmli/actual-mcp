@@ -210,25 +210,43 @@ npm run cleanup
 
 | Tool Name | Category | Description |
 |---|---|---|
-| `actual_query` | Query | Execute an ActualQL query against tables (`transactions`, `accounts`, `categories`, `payees`, `rules`, `schedules`). |
+| `actual_query` | Query | Execute an ActualQL query against all 19 budget tables (`transactions`, `accounts`, `account_groups`, `categories`, `category_groups`, `payees`, `payee_locations`, `rules`, `schedules`, `notes`, `preferences`, `custom_reports`, `dashboard`, etc.). |
 | `actual_query_tables` | Query | List all queryable database tables. |
 | `actual_query_fields` | Query | List queryable fields for a specified table. |
-| `actual_list_accounts` | Accounts | List all active or closed accounts with current balances. |
-| `actual_create_account` | Accounts | Create a new budget or off-budget account. |
-| `actual_update_account` | Accounts | Update account name or off-budget status. |
+| `actual_list_accounts` | Accounts | List all active or closed accounts with current balances, `account_group_id`, and attached `note`. |
+| `actual_create_account` | Accounts | Create a new budget or off-budget account (with optional `account_group_id` and `note`). |
+| `actual_update_account` | Accounts | Update account name, off-budget status, `account_group_id`, or `note`. |
 | `actual_get_account_balance` | Accounts | Get current balance of an account with optional date cutoff. |
+| `actual_list_account_groups` | Account Groups | List all account groups. |
+| `actual_create_account_group` | Account Groups | Create a new account group. |
+| `actual_update_account_group` | Account Groups | Update an account group's name. |
+| `actual_delete_account_group` | Account Groups | Delete an account group. |
+| `actual_get_note` | Notes | Get the note attached to an account, category, category group, or budget month (`YYYY-MM`). |
+| `actual_list_notes` | Notes | List all attached notes across accounts, categories, category groups, and budget months. |
+| `actual_update_note` | Notes | Create, update, or clear a note for an account, category, category group, or budget month. |
+| `actual_get_preferences` | Preferences | Get all budget preferences or a specific preference by key. |
+| `actual_set_preference` | Preferences | Set a budget preference value by key. |
 | `actual_list_transactions` | Transactions | List transactions filtered by account and date range. |
 | `actual_add_transactions` | Transactions | Add one or more transactions (supports split transactions). |
 | `actual_update_transaction`| Transactions | Update fields (notes, category, amount, payee) on a transaction. |
 | `actual_delete_transaction`| Transactions | Delete a transaction by ID. |
-| `actual_list_categories` | Categories | List budget categories and category groups. |
-| `actual_create_category` | Categories | Create a new budget category. |
+| `actual_merge_transactions`| Transactions | Merge two duplicate transactions into one. |
+| `actual_list_categories` | Categories | List budget categories (with optional `include_notes`). |
+| `actual_create_category` | Categories | Create a new budget category (with optional `note`). |
+| `actual_update_category` | Categories | Update a category's name, hidden status, `group_id`, or `note`. |
 | `actual_list_payees` | Payees | List payees or retrieve transfer payees. |
 | `actual_create_payee` | Payees | Create a new payee. |
+| `actual_list_payee_locations` | Payees | List geographic locations saved for payees. |
+| `actual_create_payee_location` | Payees | Create a geographic location for a payee. |
+| `actual_delete_payee_location` | Payees | Delete a payee location by ID. |
+| `actual_get_nearby_payees` | Payees | Find payees near a given latitude/longitude. |
 | `actual_list_rules` | Rules | List transaction categorization rules. |
 | `actual_list_schedules` | Schedules | List recurring payment and deposit schedules. |
+| `actual_get_schedule_dates` | Schedules | Compute upcoming occurrence dates for a schedule or recurrence config. |
+| `actual_load_budget` | Budgets | Load a locally downloaded budget by ID. |
+| `actual_import_budget` | Budgets | Import a budget archive (`actual`, `ynab4`, `nynab`). |
 | `actual_sync_budget` | Sync | Trigger a sync with the remote Actual Budget server. |
-| `actual_get_id` | Resolver | Helper tool to resolve account, category, or category group names into UUIDs. |
+| `actual_get_id` | Resolver | Helper tool to resolve account, account group, category, category group, payee, schedule, or tag names into UUIDs. |
 
 ---
 

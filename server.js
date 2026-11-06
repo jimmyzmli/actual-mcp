@@ -429,6 +429,7 @@ process.on('unhandledRejection', (err) => {
 // ───────────────────────────────────────────────────────────
 const cache = {
   accounts: null,
+  accountGroups: null,
   categories: null,
   categoryGroups: null,
   payees: null,
@@ -437,6 +438,7 @@ const cache = {
 
 function invalidateCache() {
   cache.accounts = null;
+  cache.accountGroups = null;
   cache.categories = null;
   cache.categoryGroups = null;
   cache.payees = null;
@@ -448,6 +450,13 @@ async function getCachedAccounts() {
     cache.accounts = await api.getAccounts();
   }
   return cache.accounts;
+}
+
+async function getCachedAccountGroups() {
+  if (!cache.accountGroups) {
+    cache.accountGroups = await api.getAccountGroups();
+  }
+  return cache.accountGroups;
 }
 
 async function getCachedCategories() {
@@ -623,11 +632,19 @@ const TABLE_SCHEMA = {
     parent_id: { type: 'id' },
     sort_order: { type: 'float' },
     schedule: { type: 'id', ref: 'schedules' },
+    error: { type: 'json' },
+    tombstone: { type: 'boolean' },
+    raw_synced_data: { type: 'string' },
     has_receipt: { type: 'boolean' },
     receipt: { type: 'json' },
     'account.name': { type: 'string', ref: 'accounts' },
+    'account.offbudget': { type: 'boolean', ref: 'accounts' },
+    'account.closed': { type: 'boolean', ref: 'accounts' },
     'payee.name': { type: 'string', ref: 'payees' },
+    'payee.transfer_acct': { type: 'id', ref: 'payees' },
     'category.name': { type: 'string', ref: 'categories' },
+    'category.is_income': { type: 'boolean', ref: 'categories' },
+    'category.group': { type: 'id', ref: 'category_groups' },
     'category.group.name': { type: 'string', ref: 'category_groups' },
   },
   accounts: {
@@ -636,20 +653,63 @@ const TABLE_SCHEMA = {
     offbudget: { type: 'boolean' },
     closed: { type: 'boolean' },
     sort_order: { type: 'float' },
+    tombstone: { type: 'boolean' },
+    account_id: { type: 'string' },
+    official_name: { type: 'string' },
+    account_sync_source: { type: 'string' },
+    last_reconciled: { type: 'string' },
+    last_sync: { type: 'string' },
+    bank_sync_status: { type: 'string' },
+    account_group_id: { type: 'id', ref: 'account_groups' },
+  },
+  account_groups: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    sort_order: { type: 'float' },
+    tombstone: { type: 'boolean' },
   },
   categories: {
     id: { type: 'id' },
     name: { type: 'string' },
     is_income: { type: 'boolean' },
+    group: { type: 'id', ref: 'category_groups' },
     group_id: { type: 'id', ref: 'category_groups' },
+    goal_def: { type: 'string' },
+    cleanup_def: { type: 'string' },
+    template_settings: { type: 'json' },
     sort_order: { type: 'float' },
     hidden: { type: 'boolean' },
+    tombstone: { type: 'boolean' },
     'group.name': { type: 'string', ref: 'category_groups' },
+  },
+  category_groups: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    is_income: { type: 'boolean' },
+    hidden: { type: 'boolean' },
+    sort_order: { type: 'float' },
+    tombstone: { type: 'boolean' },
+  },
+  cleanup_groups: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    tombstone: { type: 'boolean' },
   },
   payees: {
     id: { type: 'id' },
     name: { type: 'string' },
     transfer_acct: { type: 'id', ref: 'accounts' },
+    tombstone: { type: 'boolean' },
+    favorite: { type: 'boolean' },
+    learn_categories: { type: 'boolean' },
+  },
+  payee_locations: {
+    id: { type: 'id' },
+    payee_id: { type: 'id', ref: 'payees' },
+    latitude: { type: 'float' },
+    longitude: { type: 'float' },
+    created_at: { type: 'integer' },
+    tombstone: { type: 'boolean' },
   },
   rules: {
     id: { type: 'id' },
@@ -657,6 +717,7 @@ const TABLE_SCHEMA = {
     conditions_op: { type: 'string' },
     conditions: { type: 'json' },
     actions: { type: 'json' },
+    tombstone: { type: 'boolean' },
   },
   schedules: {
     id: { type: 'id' },
@@ -664,6 +725,93 @@ const TABLE_SCHEMA = {
     rule: { type: 'id', ref: 'rules' },
     next_date: { type: 'date' },
     completed: { type: 'boolean' },
+    posts_transaction: { type: 'boolean' },
+    custom_upcoming_length: { type: 'string' },
+    tombstone: { type: 'boolean' },
+    sort_order: { type: 'float' },
+    _payee: { type: 'id', ref: 'payees' },
+    _account: { type: 'id', ref: 'accounts' },
+    _amount: { type: 'json' },
+    _amountOp: { type: 'string' },
+    _date: { type: 'json' },
+    _conditions: { type: 'json' },
+    _actions: { type: 'json' },
+    _has_splits: { type: 'boolean' },
+  },
+  notes: {
+    id: { type: 'id' },
+    note: { type: 'string' },
+  },
+  preferences: {
+    id: { type: 'id' },
+    value: { type: 'string' },
+  },
+  transaction_filters: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    conditions_op: { type: 'string' },
+    conditions: { type: 'json' },
+    tombstone: { type: 'boolean' },
+  },
+  custom_reports: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    start_date: { type: 'string' },
+    end_date: { type: 'string' },
+    date_static: { type: 'integer' },
+    date_range: { type: 'string' },
+    mode: { type: 'string' },
+    group_by: { type: 'string' },
+    sort_by: { type: 'string' },
+    balance_type: { type: 'string' },
+    show_empty: { type: 'integer' },
+    show_offbudget: { type: 'integer' },
+    show_hidden: { type: 'integer' },
+    show_uncategorized: { type: 'integer' },
+    trim_intervals: { type: 'integer' },
+    show_trend_lines: { type: 'integer' },
+    include_current: { type: 'integer' },
+    graph_type: { type: 'string' },
+    conditions: { type: 'json' },
+    conditions_op: { type: 'string' },
+    metadata: { type: 'json' },
+    interval: { type: 'string' },
+    color_scheme: { type: 'json' },
+    tombstone: { type: 'boolean' },
+  },
+  reflect_budgets: {
+    id: { type: 'id' },
+    month: { type: 'integer' },
+    category: { type: 'string' },
+    amount: { type: 'integer' },
+    carryover: { type: 'integer' },
+    goal: { type: 'integer' },
+    long_goal: { type: 'integer' },
+  },
+  zero_budgets: {
+    id: { type: 'id' },
+    month: { type: 'integer' },
+    category: { type: 'string', ref: 'categories' },
+    amount: { type: 'integer' },
+    carryover: { type: 'integer' },
+    goal: { type: 'integer' },
+    long_goal: { type: 'integer' },
+  },
+  dashboard_pages: {
+    id: { type: 'id' },
+    name: { type: 'string' },
+    tombstone: { type: 'boolean' },
+  },
+  dashboard: {
+    id: { type: 'id' },
+    dashboard_page_id: { type: 'id', ref: 'dashboard_pages' },
+    type: { type: 'string' },
+    width: { type: 'integer' },
+    height: { type: 'integer' },
+    x: { type: 'integer' },
+    y: { type: 'integer' },
+    meta: { type: 'json' },
+    tombstone: { type: 'boolean' },
   },
   receipts: {
     id: { type: 'id' },
@@ -789,6 +937,181 @@ function buildQueryFromFile(parsed, fallbackTable) {
 // Command Handlers — Direct API calls, no subprocess spawning
 // ───────────────────────────────────────────────────────────
 
+async function resolveNoteId(id, type) {
+  if (!id) throw new Error('Note ID (or entity ID) is required');
+  const rawId = String(id).trim();
+  if (type === 'account') {
+    return rawId.startsWith('account-') ? rawId : `account-${rawId}`;
+  }
+  if (type === 'budget') {
+    return rawId.startsWith('budget-') ? rawId : `budget-${rawId}`;
+  }
+  if (type === 'category' || type === 'raw') {
+    return rawId;
+  }
+  if (rawId.startsWith('account-') || rawId.startsWith('budget-')) {
+    return rawId;
+  }
+  if (/^\d{4}-\d{2}$/.test(rawId)) {
+    return `budget-${rawId}`;
+  }
+  const accounts = await getCachedAccounts();
+  if (accounts.some(a => a.id === rawId)) {
+    return `account-${rawId}`;
+  }
+  return rawId;
+}
+
+async function handleNotes(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      const result = await api.aqlQuery(api.q('notes').select(['id', 'note']));
+      const rows = Array.isArray(result?.data) ? result.data : [];
+      const includeEmpty = !!opts['include-empty'] || !!opts.include_empty;
+      const filterType = opts.type;
+      const [accounts, categories, categoryGroups] = await Promise.all([
+        getCachedAccounts(),
+        getCachedCategories(),
+        getCachedCategoryGroups(),
+      ]);
+      const accountMap = new Map(accounts.map(a => [a.id, a.name]));
+      const categoryMap = new Map(categories.map(c => [c.id, c.name]));
+      const groupMap = new Map(categoryGroups.map(g => [g.id, g.name]));
+
+      const enriched = [];
+      for (const row of rows) {
+        if (!includeEmpty && (!row.note || row.note.trim() === '')) continue;
+        let entityType = 'other';
+        let entityId = row.id;
+        let entityName = null;
+        if (row.id.startsWith('account-')) {
+          entityType = 'account';
+          entityId = row.id.slice('account-'.length);
+          entityName = accountMap.get(entityId) ?? null;
+        } else if (row.id.startsWith('budget-')) {
+          entityType = 'budget';
+          entityId = row.id.slice('budget-'.length);
+          entityName = entityId;
+        } else if (categoryMap.has(row.id)) {
+          entityType = 'category';
+          entityName = categoryMap.get(row.id);
+        } else if (groupMap.has(row.id)) {
+          entityType = 'category_group';
+          entityName = groupMap.get(row.id);
+        } else if (accountMap.has(row.id)) {
+          entityType = 'account';
+          entityName = accountMap.get(row.id);
+        }
+        if (filterType && filterType !== 'all' && entityType !== filterType) continue;
+        enriched.push({
+          id: entityId,
+          note_id: row.id,
+          type: entityType,
+          name: entityName,
+          note: row.note,
+        });
+      }
+      return enriched;
+    }
+    case 'get': {
+      await ensureBudget();
+      const rawId = opts._positional[0] || opts.id;
+      if (!rawId) throw new Error('Note ID (or entity ID) is required');
+      const noteId = await resolveNoteId(rawId, opts.type);
+      let res = await api.getNote(noteId);
+      if (!res && noteId === rawId && !rawId.startsWith('account-') && !rawId.startsWith('budget-')) {
+        const acctRes = await api.getNote(`account-${rawId}`);
+        if (acctRes) {
+          return { id: rawId, note_id: `account-${rawId}`, note: acctRes.note };
+        }
+      }
+      return {
+        id: rawId,
+        note_id: noteId,
+        note: res ? res.note : null,
+      };
+    }
+    case 'set':
+    case 'update': {
+      await ensureBudget();
+      const rawId = opts._positional[0] || opts.id;
+      if (!rawId) throw new Error('Note ID (or entity ID) is required');
+      if (opts.note === undefined) throw new Error('--note is required');
+      const noteId = await resolveNoteId(rawId, opts.type);
+      const noteText = opts.note === null ? '' : String(opts.note);
+      await api.updateNote(noteId, noteText);
+      return { success: true, id: rawId, note_id: noteId, note: noteText };
+    }
+    default:
+      throw new Error(`Unknown notes subcommand: ${subCmd}`);
+  }
+}
+
+async function handlePreferences(subCmd, opts) {
+  switch (subCmd) {
+    case 'list':
+    case 'get':
+    case '': {
+      await ensureBudget();
+      const prefs = await api.getPreferences();
+      const key = opts._positional[0] || opts.key || opts.id;
+      if (key) {
+        return { key, value: prefs?.[key] ?? null };
+      }
+      return prefs;
+    }
+    case 'set':
+    case 'update': {
+      await ensureBudget();
+      const key = opts._positional[0] || opts.key || opts.id;
+      if (!key) throw new Error('Preference key (--key or positional) is required');
+      if (opts.value === undefined) throw new Error('--value is required');
+      const val = opts.value === 'null' || opts.value === null ? undefined : String(opts.value);
+      await api.setPreference(key, val);
+      return { success: true, key, value: val ?? null };
+    }
+    default:
+      throw new Error(`Unknown preferences subcommand: ${subCmd}`);
+  }
+}
+
+async function handleAccountGroups(subCmd, opts) {
+  switch (subCmd) {
+    case 'list': {
+      await ensureBudget();
+      return await getCachedAccountGroups();
+    }
+    case 'create': {
+      await ensureBudget();
+      if (!opts.name) throw new Error('--name is required');
+      const id = await api.createAccountGroup({ name: opts.name });
+      cache.accountGroups = null;
+      return { id };
+    }
+    case 'update': {
+      await ensureBudget();
+      const id = opts._positional[0] || opts.id;
+      if (!id) throw new Error('Account group ID is required');
+      if (!opts.name) throw new Error('--name is required');
+      await api.updateAccountGroup(id, { name: opts.name });
+      cache.accountGroups = null;
+      return { success: true, id };
+    }
+    case 'delete': {
+      await ensureBudget();
+      const id = opts._positional[0] || opts.id;
+      if (!id) throw new Error('Account group ID is required');
+      await api.deleteAccountGroup(id);
+      cache.accountGroups = null;
+      cache.accounts = null;
+      return { success: true, id };
+    }
+    default:
+      throw new Error(`Unknown account-groups subcommand: ${subCmd}`);
+  }
+}
+
 async function handleAccounts(subCmd, opts) {
   switch (subCmd) {
     case 'list': {
@@ -796,18 +1119,38 @@ async function handleAccounts(subCmd, opts) {
       const allAccounts = await getCachedAccounts();
       const accounts = allAccounts.filter(a => opts['include-closed'] || !a.closed);
       accounts.sort((a, b) => Number(a.offbudget) - Number(b.offbudget));
-      const balances = await Promise.all(accounts.map(a => api.getAccountBalance(a.id)));
+      const [balances, notesResult] = await Promise.all([
+        Promise.all(accounts.map(a => api.getAccountBalance(a.id))),
+        api.aqlQuery(api.q('notes').filter({ id: { $like: 'account-%' } }).select(['id', 'note'])).catch(() => ({ data: [] })),
+      ]);
+      const noteMap = new Map();
+      if (Array.isArray(notesResult?.data)) {
+        for (const n of notesResult.data) {
+          if (n.note) noteMap.set(n.id, n.note);
+        }
+      }
       return accounts.map((a, i) => ({
-        id: a.id, name: a.name, offbudget: a.offbudget, closed: a.closed, balance: balances[i],
+        id: a.id,
+        name: a.name,
+        offbudget: a.offbudget,
+        closed: a.closed,
+        balance: balances[i],
+        account_group_id: a.account_group_id ?? null,
+        note: noteMap.get(`account-${a.id}`) ?? null,
       }));
     }
     case 'create': {
       await ensureBudget();
       const balance = opts.balance ? parseIntFlag(opts.balance, '--balance') : 0;
+      const accountPayload = { name: opts.name, offbudget: !!opts.offbudget };
+      if (opts['account-group-id']) accountPayload.account_group_id = opts['account-group-id'];
       const id = await api.createAccount(
-        { name: opts.name, offbudget: !!opts.offbudget },
+        accountPayload,
         balance,
       );
+      if (opts.note !== undefined) {
+        await api.updateNote(`account-${id}`, opts.note === null ? '' : String(opts.note));
+      }
       cache.accounts = null;
       return { id };
     }
@@ -824,12 +1167,28 @@ async function handleAccounts(subCmd, opts) {
       if (opts.offbudget !== undefined) {
         fields.offbudget = parseBoolFlag(opts.offbudget, '--offbudget');
       }
-      if (Object.keys(fields).length === 0) {
-        throw new Error('No update fields provided. Use --name or --offbudget.');
+      if (opts['account-group-id'] !== undefined) {
+        fields.account_group_id = (opts['account-group-id'] === '' || opts['account-group-id'] === 'null') ? null : opts['account-group-id'];
       }
-      await api.updateAccount(id, fields);
-      cache.accounts = null;
+      if (Object.keys(fields).length === 0 && opts.note === undefined) {
+        throw new Error('No update fields provided. Use --name, --offbudget, --account-group-id, or --note.');
+      }
+      if (Object.keys(fields).length > 0) {
+        await api.updateAccount(id, fields);
+        cache.accounts = null;
+      }
+      if (opts.note !== undefined) {
+        await api.updateNote(`account-${id}`, opts.note === null ? '' : String(opts.note));
+      }
       return { success: true, id };
+    }
+    case 'get-note':
+    case 'note': {
+      return handleNotes('get', { ...opts, type: 'account' });
+    }
+    case 'update-note':
+    case 'set-note': {
+      return handleNotes('update', { ...opts, type: 'account' });
     }
     case 'close': {
       await ensureBudget();
@@ -882,6 +1241,27 @@ async function handleBudgets(subCmd, opts) {
       await ensureInit();
       const result = await api.getBudgets();
       return result;
+    }
+    case 'load': {
+      await ensureInit();
+      const budgetId = opts._positional[0] || opts.id;
+      if (!budgetId) throw new Error('Budget ID is required');
+      await api.loadBudget(budgetId);
+      budgetLoaded = true;
+      invalidateCache();
+      return { success: true, id: budgetId };
+    }
+    case 'import': {
+      await ensureInit();
+      const filepath = opts._positional[0] || opts.file;
+      if (!filepath) throw new Error('File path (--file or positional) is required');
+      const importOpts = {};
+      if (opts.type) importOpts.type = opts.type;
+      if (opts.filename) importOpts.filename = opts.filename;
+      const result = await api.importBudget(filepath, importOpts);
+      budgetLoaded = true;
+      invalidateCache();
+      return { success: true, ...result };
     }
     case 'download': {
       await ensureInit();
@@ -1014,6 +1394,17 @@ async function handleTransactions(subCmd, opts) {
       await api.deleteTransaction(id);
       return { success: true, id };
     }
+    case 'merge': {
+      await ensureBudget();
+      const ids = opts._positional.length >= 2
+        ? opts._positional.slice(0, 2)
+        : (opts.ids ? String(opts.ids).split(',').map(s => s.trim()).filter(Boolean) : []);
+      if (ids.length !== 2) {
+        throw new Error('Exactly two transaction IDs are required to merge (pass as positional arguments or --ids id1,id2)');
+      }
+      const keptId = await api.mergeTransactions([ids[0], ids[1]]);
+      return { success: true, id: keptId, merged: ids };
+    }
     case 'restore-notes': {
       await ensureBudget();
       const ids = opts._positional.length > 0 ? opts._positional : (opts.ids ? opts.ids.split(',') : []);
@@ -1125,7 +1516,13 @@ async function handleCategories(subCmd, opts) {
   switch (subCmd) {
     case 'list': {
       await ensureBudget();
-      return await getCachedCategories();
+      const categories = await getCachedCategories();
+      if (opts['include-notes'] || opts.include_notes) {
+        const notesRes = await api.aqlQuery(api.q('notes').select(['id', 'note'])).catch(() => ({ data: [] }));
+        const noteMap = new Map((notesRes?.data || []).map(n => [n.id, n.note]));
+        return categories.map(c => ({ ...c, note: noteMap.get(c.id) ?? null }));
+      }
+      return categories;
     }
     case 'create': {
       await ensureBudget();
@@ -1137,6 +1534,9 @@ async function handleCategories(subCmd, opts) {
         is_income: !!opts['is-income'],
         hidden: false,
       });
+      if (opts.note !== undefined) {
+        await api.updateNote(id, opts.note === null ? '' : String(opts.note));
+      }
       cache.categories = null;
       return { id };
     }
@@ -1147,11 +1547,18 @@ async function handleCategories(subCmd, opts) {
       const fields = {};
       if (opts.name !== undefined) fields.name = opts.name;
       if (opts.hidden !== undefined) fields.hidden = parseBoolFlag(opts.hidden, '--hidden');
-      if (Object.keys(fields).length === 0) {
-        throw new Error('No update fields provided. Use --name or --hidden.');
+      if (opts['group-id'] !== undefined) fields.group_id = opts['group-id'];
+      if (Object.keys(fields).length === 0 && opts.note === undefined) {
+        throw new Error('No update fields provided. Use --name, --hidden, --group-id, or --note.');
       }
-      await api.updateCategory(id, fields);
-      cache.categories = null;
+      if (Object.keys(fields).length > 0) {
+        await api.updateCategory(id, fields);
+        cache.categories = null;
+        cache.categoryGroups = null;
+      }
+      if (opts.note !== undefined) {
+        await api.updateNote(id, opts.note === null ? '' : String(opts.note));
+      }
       return { success: true, id };
     }
     case 'delete': {
@@ -1261,6 +1668,49 @@ async function handlePayees(subCmd, opts) {
       cache.payees = null;
       return { success: true };
     }
+    case 'locations': {
+      await ensureBudget();
+      const payeeId = opts._positional[0] || opts['payee-id'] || opts.payee_id;
+      if (payeeId && api.internal?.send) {
+        return await api.internal.send('api/payee-locations-get', { payeeId });
+      }
+      let q = api.q('payee_locations').select(['*']);
+      if (payeeId) q = q.filter({ payee_id: payeeId });
+      const res = await api.aqlQuery(q);
+      return res?.data ?? [];
+    }
+    case 'location-create': {
+      await ensureBudget();
+      const payeeId = opts._positional[0] || opts['payee-id'] || opts.payee_id;
+      if (!payeeId) throw new Error('Payee ID is required');
+      if (opts.latitude === undefined || opts.longitude === undefined) {
+        throw new Error('Both --latitude and --longitude are required');
+      }
+      const latitude = Number(opts.latitude);
+      const longitude = Number(opts.longitude);
+      if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+        throw new Error('--latitude and --longitude must be valid numbers');
+      }
+      const id = await api.internal.send('api/payee-location-create', { payeeId, latitude, longitude });
+      return { id, payee_id: payeeId, latitude, longitude };
+    }
+    case 'location-delete': {
+      await ensureBudget();
+      const id = opts._positional[0] || opts.id;
+      if (!id) throw new Error('Payee location ID is required');
+      await api.internal.send('api/payee-location-delete', { id });
+      return { success: true, id };
+    }
+    case 'nearby': {
+      await ensureBudget();
+      if (opts.latitude === undefined || opts.longitude === undefined) {
+        throw new Error('Both --latitude and --longitude are required');
+      }
+      const latitude = Number(opts.latitude);
+      const longitude = Number(opts.longitude);
+      const maxDistance = opts['max-distance'] !== undefined ? Number(opts['max-distance']) : undefined;
+      return await api.internal.send('api/payees-get-nearby', { latitude, longitude, maxDistance });
+    }
     default:
       throw new Error(`Unknown payees subcommand: ${subCmd}`);
   }
@@ -1353,6 +1803,31 @@ async function handleSchedules(subCmd, opts) {
       await ensureBudget();
       return await api.getSchedules();
     }
+    case 'dates': {
+      await ensureBudget();
+      let dateConfig = opts.date || opts.data;
+      const scheduleId = opts._positional[0] || opts.id || opts['schedule-id'];
+      if (scheduleId && !dateConfig) {
+        const schedules = await api.getSchedules();
+        const found = schedules.find(s => s.id === scheduleId || s.name === scheduleId);
+        if (!found) throw new Error(`Schedule not found: ${scheduleId}`);
+        dateConfig = found.date;
+      } else if (typeof dateConfig === 'string') {
+        const trimmed = dateConfig.trim();
+        if (trimmed.startsWith('{')) {
+          dateConfig = JSON.parse(trimmed);
+        }
+      }
+      if (!dateConfig) {
+        throw new Error('Either a schedule ID (positional or --id) or --date (YYYY-MM-DD or RecurConfig JSON) is required');
+      }
+      const dateOpts = {};
+      if (opts.start) dateOpts.start = opts.start;
+      if (opts.end) dateOpts.end = opts.end;
+      if (opts.count !== undefined) dateOpts.count = parseIntFlag(opts.count, '--count');
+      const dates = await api.getScheduleDates(dateConfig, dateOpts);
+      return { dates };
+    }
     case 'create': {
       await ensureBudget();
       const schedule = readJsonInput(opts);
@@ -1425,12 +1900,18 @@ async function handleQuery(subCmd, opts) {
       }
       await ensureBudget();
       let queryObj;
+      let effectiveTable = opts.table;
       if (opts.file || opts.data) {
         const parsed = readJsonInput(opts);
         if (!isRecord(parsed)) throw new Error('Query file must contain a JSON object');
+        if (parsed.table === 'receipts' || effectiveTable === 'receipts') {
+          return queryReceipts({ ...opts, ...parsed });
+        }
+        effectiveTable = typeof parsed.table === 'string' ? parsed.table : effectiveTable;
         queryObj = buildQueryFromFile(parsed, opts.table);
       } else {
         queryObj = buildQuery(opts);
+        effectiveTable = effectiveTable || 'transactions';
       }
       const result = await api.aqlQuery(queryObj);
       if (!isRecord(result) || !('data' in result)) {
@@ -1440,7 +1921,7 @@ async function handleQuery(subCmd, opts) {
         return { count: result.data };
       }
       const data = result.data;
-      if (Array.isArray(data) && (opts.table === 'transactions' || !opts.table)) {
+      if (Array.isArray(data) && effectiveTable === 'transactions') {
         if (!opts['no-receipts'] && !opts.no_receipts && opts['with-receipts'] !== false) {
           return enrichTransactionsWithReceipts(data);
         }
@@ -1467,14 +1948,30 @@ async function handleServer(subCmd, opts) {
       await ensureBudget();
       if (!opts.type) throw new Error('--type is required');
       if (!opts.name) throw new Error('--name is required');
+      const normalizedType = opts.type.replace(/-/g, '_');
+      if (['accounts', 'schedules', 'categories', 'payees'].includes(normalizedType)) {
+        const id = await api.getIDByName(normalizedType, opts.name);
+        return { id, type: opts.type, name: opts.name };
+      }
+      if (['category_groups', 'account_groups'].includes(normalizedType)) {
+        const res = await api.aqlQuery(api.q(normalizedType).filter({ name: opts.name }).select(['id']));
+        if (!res?.data?.length) throw new Error(`Not found: ${opts.type} with name ${opts.name}`);
+        return { id: res.data[0].id, type: opts.type, name: opts.name };
+      }
+      if (normalizedType === 'tags') {
+        const tags = await getCachedTags();
+        const found = tags.find(t => t.tag === opts.name);
+        if (!found) throw new Error(`Not found: tags with name ${opts.name}`);
+        return { id: found.id, type: opts.type, name: opts.name };
+      }
       const id = await api.getIDByName(opts.type, opts.name);
       return { id, type: opts.type, name: opts.name };
     }
     case 'bank-sync': {
       await ensureBudget();
       const args = opts.account ? { accountId: opts.account } : undefined;
-      await api.runBankSync(args);
-      return { success: true };
+      const syncResult = await api.runBankSync(args);
+      return { success: true, ...(syncResult || {}) };
     }
     default:
       throw new Error(`Unknown server subcommand: ${subCmd}`);
@@ -1486,6 +1983,9 @@ async function handleServer(subCmd, opts) {
 // ───────────────────────────────────────────────────────────
 const COMMAND_HANDLERS = {
   accounts: handleAccounts,
+  'account-groups': handleAccountGroups,
+  notes: handleNotes,
+  preferences: handlePreferences,
   budgets: handleBudgets,
   transactions: handleTransactions,
   categories: handleCategories,
@@ -1531,18 +2031,46 @@ const COMMAND_SCHEMAS = {
     desc: "Manage accounts.",
     details: "Subcommands:\n" +
       "- list [--include-closed] [--format json|table|csv]\n" +
-      "- create --name <name> [--offbudget] [--balance <cents>]\n" +
-      "- update <id> [--name <name>] [--offbudget <bool>]\n" +
+      "- create --name <name> [--offbudget] [--balance <cents>] [--account-group-id <id>] [--note <text>]\n" +
+      "- update <id> [--name <name>] [--offbudget <bool>] [--account-group-id <id>] [--note <text>]\n" +
+      "- get-note <id>\n" +
+      "- update-note <id> --note <text>\n" +
       "- close <id> [--transfer-account <id>] [--transfer-category <id>]\n" +
       "- reopen <id>\n" +
       "- delete <id>\n" +
       "- balance <id> [--cutoff <YYYY-MM-DD>]",
     rules: "Rules:\n- Accounts must be referenced by their UUID.\n- Use `balance` with an account ID to get its current balance."
   },
+  'account-groups': {
+    desc: "Manage account groups.",
+    details: "Subcommands:\n" +
+      "- list\n" +
+      "- create --name <name>\n" +
+      "- update <id> --name <name>\n" +
+      "- delete <id>",
+    rules: "Rules:\n- Account groups organize accounts in the sidebar."
+  },
+  notes: {
+    desc: "Manage entity notes (accounts, categories, budget months).",
+    details: "Subcommands:\n" +
+      "- list [--type account|category|budget|all] [--include-empty]\n" +
+      "- get <id> [--type account|category|budget|raw]\n" +
+      "- update <id> --note <text> [--type account|category|budget|raw]",
+    rules: "Rules:\n- Automatically resolves account UUIDs to `account-<id>` and YYYY-MM months to `budget-<YYYY-MM>`."
+  },
+  preferences: {
+    desc: "Manage synced budget preferences.",
+    details: "Subcommands:\n" +
+      "- get [<key>]\n" +
+      "- set <key> --value <value>",
+    rules: "Rules:\n- Preferences are stored as string key-value pairs."
+  },
   budgets: {
     desc: "Manage budgets.",
     details: "Subcommands:\n" +
       "- list\n" +
+      "- load <budgetId>\n" +
+      "- import --file <path> [--type actual|ynab4|nynab] [--filename <name>]\n" +
       "- download <syncId> [--encryption-password <pw>]\n" +
       "- months\n" +
       "- month <YYYY-MM>\n" +
@@ -1561,16 +2089,17 @@ const COMMAND_SCHEMAS = {
       "- import --account <id> (--data <json> | --file <path>) [--dry-run]\n" +
       "- update <id> (--data <json> | --file <path>)\n" +
       "- delete <id>\n" +
+      "- merge <id1> <id2>\n" +
       "- restore-notes <id1> <id2> ...\n" +
       "- restore-transaction <id1> <id2> ...",
-    rules: "Rules:\n- list: ALL of `--account`, `--start`, and `--end` are absolutely required or the command will fail.\n- add/import: MUST provide `--account` and either `--data` (as JSON string) or `--file`.\n- update: Takes the transaction ID as a positional argument. The `--data` flag must contain fields to update.\n- restore-notes: Takes a list of transaction IDs and restores their notes from backup.sqlite.\n- restore-transaction: Takes a list of transaction IDs and restores all fields from backup.sqlite."
+    rules: "Rules:\n- list: ALL of `--account`, `--start`, and `--end` are absolutely required or the command will fail.\n- add/import: MUST provide `--account` and either `--data` (as JSON string) or `--file`.\n- update: Takes the transaction ID as a positional argument. The `--data` flag must contain fields to update.\n- merge: Merges two transactions into one.\n- restore-notes: Takes a list of transaction IDs and restores their notes from backup.sqlite.\n- restore-transaction: Takes a list of transaction IDs and restores all fields from backup.sqlite."
   },
   categories: {
     desc: "Manage categories.",
     details: "Subcommands:\n" +
-      "- list [--include-hidden]\n" +
-      "- create --name <name> --group-id <id> [--is-income]\n" +
-      "- update <id> [--name <name>] [--hidden <bool>]\n" +
+      "- list [--include-hidden] [--include-notes]\n" +
+      "- create --name <name> --group-id <id> [--is-income] [--note <text>]\n" +
+      "- update <id> [--name <name>] [--hidden <bool>] [--group-id <id>] [--note <text>]\n" +
       "- delete <id> [--transfer-to <id>]",
     rules: "Rules:\n- create MUST have both `--name` and `--group-id`.\n- update MUST have at least one flag to change."
   },
@@ -1591,7 +2120,11 @@ const COMMAND_SCHEMAS = {
       "- create --name <name>\n" +
       "- update <id> --name <name>\n" +
       "- delete <id>\n" +
-      "- merge --target <id> --ids <id1,id2,id3>",
+      "- merge --target <id> --ids <id1,id2,id3>\n" +
+      "- locations [<payeeId>]\n" +
+      "- location-create <payeeId> --latitude <lat> --longitude <lng>\n" +
+      "- location-delete <locationId>\n" +
+      "- nearby --latitude <lat> --longitude <lng> [--max-distance <meters>]",
     rules: "Rules:\n- merge requires `--target` (the final ID) and `--ids` (comma separated list to merge)."
   },
   tags: {
@@ -1617,6 +2150,7 @@ const COMMAND_SCHEMAS = {
     desc: "Manage scheduled transactions.",
     details: "Subcommands:\n" +
       "- list\n" +
+      "- dates [<scheduleId>] [--date <YYYY-MM-DD|json>] [--start <YYYY-MM-DD>] [--end <YYYY-MM-DD>] [--count <n>]\n" +
       "- create (--data <json> | --file <path>)\n" +
       "- update <id> (--data <json> | --file <path>) [--reset-next-date]\n" +
       "- delete <id>",
@@ -1644,7 +2178,7 @@ const COMMAND_SCHEMAS = {
       "- version\n" +
       "- get-id --type <type> --name <name>\n" +
       "- bank-sync [--account <id>]",
-    rules: "Rules:\n- `get-id` requires `--type` (e.g. 'accounts') and `--name`."
+    rules: "Rules:\n- `get-id` requires `--type` (e.g. 'accounts', 'account_groups', 'categories', 'category_groups', 'payees', 'schedules', 'tags') and `--name`."
   },
   receipts: {
     desc: "Manage and query receipts (PocketBase backed with local SQLite cache).",
@@ -1741,7 +2275,7 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_list_accounts",
     readOnly: true,
-    description: "[READ-ONLY] List all budget and off-budget accounts, including IDs, names, closed status, and current balances in cents.",
+    description: "[READ-ONLY] List all budget and off-budget accounts, including IDs, names, closed status, current balances in cents, account_group_id, and attached account notes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1775,6 +2309,76 @@ export const MCP_TOOL_DEFINITIONS = [
       if (Array.isArray(input.args)) return ["accounts", "balance", ...input.args];
       const cli = ["accounts", "balance", input.id];
       if (input.cutoff) cli.push("--cutoff", input.cutoff);
+      return cli;
+    }
+  },
+  {
+    name: "actual_list_account_groups",
+    readOnly: true,
+    description: "[READ-ONLY] List all account groups in the budget.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => ["account-groups", "list", ...(input.args || [])]
+  },
+  {
+    name: "actual_get_note",
+    readOnly: true,
+    description: "[READ-ONLY] Get the note attached to an account, category, category group, budget month (YYYY-MM), or raw note ID. Accepts bare account UUIDs (automatically resolves 'account-<id>'), category UUIDs, or 'YYYY-MM' months.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Entity UUID (account or category), month (YYYY-MM), or raw note ID (e.g. 'account-<uuid>', 'budget-YYYY-MM')" },
+        type: { type: "string", enum: ["account", "category", "budget", "raw"], description: "Optional entity type hint ('account', 'category', 'budget', 'raw')" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["notes", "get", ...input.args];
+      const cli = ["notes", "get", input.id];
+      if (input.type) cli.push("--type", input.type);
+      return cli;
+    }
+  },
+  {
+    name: "actual_list_notes",
+    readOnly: true,
+    description: "[READ-ONLY] List all notes attached to accounts, categories, category groups, and budget months, enriched with entity names and types.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["account", "category", "category_group", "budget", "all"], description: "Filter by entity type (default: 'all')" },
+        include_empty: { type: "boolean", description: "Include empty/cleared notes (default: false)" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["notes", "list", ...input.args];
+      const cli = ["notes", "list"];
+      if (input.type) cli.push("--type", input.type);
+      if (input.include_empty || input["include-empty"]) cli.push("--include-empty");
+      return cli;
+    }
+  },
+  {
+    name: "actual_get_preferences",
+    readOnly: true,
+    description: "[READ-ONLY] Get all budget preferences (or a single preference value by key, e.g. 'firstDayOfWeekIdx', 'dateFormat', 'numberFormat', 'defaultCurrencyCode').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "Optional preference key to retrieve a single setting" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["preferences", "get", ...input.args];
+      const cli = ["preferences", "get"];
+      if (input.key) cli.push(input.key);
       return cli;
     }
   },
@@ -1859,11 +2463,12 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_list_categories",
     readOnly: true,
-    description: "[READ-ONLY] List all budget categories with IDs, names, group IDs, and hidden status.",
+    description: "[READ-ONLY] List all budget categories with IDs, names, group IDs, hidden status, and optional category notes.",
     inputSchema: {
       type: "object",
       properties: {
         include_hidden: { type: "boolean", description: "Include hidden categories" },
+        include_notes: { type: "boolean", description: "Include category notes (default: false)" },
         args: { type: "array", items: { type: "string" } }
       }
     },
@@ -1871,6 +2476,7 @@ export const MCP_TOOL_DEFINITIONS = [
       if (Array.isArray(input.args)) return ["categories", "list", ...input.args];
       const cli = ["categories", "list"];
       if (input.include_hidden || input["include-hidden"]) cli.push("--include-hidden");
+      if (input.include_notes || input["include-notes"]) cli.push("--include-notes");
       return cli;
     }
   },
@@ -1915,6 +2521,47 @@ export const MCP_TOOL_DEFINITIONS = [
       }
     },
     toCli: (input = {}) => ["payees", "common", ...(input.args || [])]
+  },
+  {
+    name: "actual_list_payee_locations",
+    readOnly: true,
+    description: "[READ-ONLY] List saved geographic locations for all payees or a specific payee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        payee_id: { type: "string", description: "Optional payee UUID to filter locations" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "locations", ...input.args];
+      const cli = ["payees", "locations"];
+      if (input.payee_id || input["payee-id"]) cli.push("--payee-id", input.payee_id || input["payee-id"]);
+      return cli;
+    }
+  },
+  {
+    name: "actual_get_nearby_payees",
+    readOnly: true,
+    description: "[READ-ONLY] Find payees near a given latitude and longitude.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        latitude: { type: "number", description: "Latitude coordinate" },
+        longitude: { type: "number", description: "Longitude coordinate" },
+        max_distance: { type: "number", description: "Optional maximum distance in meters" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["latitude", "longitude"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "nearby", ...input.args];
+      const cli = ["payees", "nearby", "--latitude", String(input.latitude), "--longitude", String(input.longitude)];
+      if (input.max_distance !== undefined || input["max-distance"] !== undefined) {
+        cli.push("--max-distance", String(input.max_distance ?? input["max-distance"]));
+      }
+      return cli;
+    }
   },
   {
     name: "actual_list_tags",
@@ -1970,6 +2617,32 @@ export const MCP_TOOL_DEFINITIONS = [
     toCli: (input = {}) => ["schedules", "list", ...(input.args || [])]
   },
   {
+    name: "actual_get_schedule_dates",
+    readOnly: true,
+    description: "[READ-ONLY] Compute upcoming occurrence dates for a scheduled transaction (by schedule ID/name or RecurConfig/date).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Schedule UUID or name (looks up the schedule's RecurConfig)" },
+        date: { type: ["object", "string"], description: "Date string (YYYY-MM-DD) or RecurConfig JSON object if not using schedule id" },
+        start: { type: "string", description: "Optional start date (YYYY-MM-DD)" },
+        end: { type: "string", description: "Optional end date (YYYY-MM-DD)" },
+        count: { type: "integer", description: "Optional number of upcoming occurrences to compute" },
+        args: { type: "array", items: { type: "string" } }
+      }
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["schedules", "dates", ...input.args];
+      const cli = ["schedules", "dates"];
+      if (input.id || input.schedule_id) cli.push("--id", input.id || input.schedule_id);
+      if (input.date) cli.push("--date", typeof input.date === "object" ? JSON.stringify(input.date) : input.date);
+      if (input.start) cli.push("--start", input.start);
+      if (input.end) cli.push("--end", input.end);
+      if (input.count !== undefined) cli.push("--count", String(input.count));
+      return cli;
+    }
+  },
+  {
     name: "actual_get_server_version",
     readOnly: true,
     description: "[READ-ONLY] Get the Actual Budget server version.",
@@ -1984,11 +2657,11 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_get_id",
     readOnly: true,
-    description: "[READ-ONLY] Look up an entity UUID by its type ('accounts', 'categories', 'category_groups', 'payees') and name.",
+    description: "[READ-ONLY] Look up an entity UUID by its type ('accounts', 'account_groups', 'categories', 'category_groups', 'payees', 'schedules', 'tags') and name.",
     inputSchema: {
       type: "object",
       properties: {
-        type: { type: "string", description: "Entity type ('accounts', 'categories', 'category_groups', 'payees')" },
+        type: { type: "string", description: "Entity type ('accounts', 'account_groups', 'categories', 'category_groups', 'payees', 'schedules', 'tags')" },
         name: { type: "string", description: "Exact name to look up" },
         args: { type: "array", items: { type: "string" } }
       },
@@ -2151,15 +2824,56 @@ export const MCP_TOOL_DEFINITIONS = [
 
   // ─── MUTATING TOOLS ───
   {
+    name: "actual_update_note",
+    readOnly: false,
+    description: "[MUTATING] Create, update, or clear a note attached to an account, category, category group, budget month (YYYY-MM), or raw note ID. Accepts bare account UUIDs (automatically resolves 'account-<id>'), category UUIDs, or 'YYYY-MM' months.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Entity UUID (account or category), month (YYYY-MM), or raw note ID (e.g. 'account-<uuid>', 'budget-YYYY-MM')" },
+        note: { type: ["string", "null"], description: "Note text content (pass empty string or null to clear)" },
+        type: { type: "string", enum: ["account", "category", "budget", "raw"], description: "Optional entity type hint ('account', 'category', 'budget', 'raw')" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id", "note"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["notes", "update", ...input.args];
+      const cli = ["notes", "update", input.id, "--note", input.note === null ? "" : String(input.note)];
+      if (input.type) cli.push("--type", input.type);
+      return cli;
+    }
+  },
+  {
+    name: "actual_set_preference",
+    readOnly: false,
+    description: "[MUTATING] Set a budget preference value by key (e.g. 'firstDayOfWeekIdx', 'dateFormat', 'numberFormat', 'defaultCurrencyCode', 'hideFraction').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "Preference key" },
+        value: { type: ["string", "number", "boolean", "null"], description: "Preference value" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["key", "value"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["preferences", "set", ...input.args];
+      return ["preferences", "set", input.key, "--value", input.value === null ? "null" : String(input.value)];
+    }
+  },
+  {
     name: "actual_create_account",
     readOnly: false,
-    description: "[MUTATING] Create a new account in Actual Budget.",
+    description: "[MUTATING] Create a new account in Actual Budget, with optional starting balance, account group, and account note.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "Account name" },
         offbudget: { type: "boolean", description: "Whether account is offbudget (default: false)" },
         balance: { type: "integer", description: "Starting balance in cents (default: 0)" },
+        account_group_id: { type: "string", description: "Optional account group UUID" },
+        note: { type: "string", description: "Optional initial note attached to the account" },
         args: { type: "array", items: { type: "string" } }
       },
       required: ["name"]
@@ -2169,19 +2883,25 @@ export const MCP_TOOL_DEFINITIONS = [
       const cli = ["accounts", "create", "--name", input.name];
       if (input.offbudget) cli.push("--offbudget");
       if (input.balance !== undefined) cli.push("--balance", String(input.balance));
+      if (input.account_group_id || input["account-group-id"]) {
+        cli.push("--account-group-id", input.account_group_id || input["account-group-id"]);
+      }
+      if (input.note !== undefined) cli.push("--note", input.note === null ? "" : String(input.note));
       return cli;
     }
   },
   {
     name: "actual_update_account",
     readOnly: false,
-    description: "[MUTATING] Update an existing account's name or offbudget status.",
+    description: "[MUTATING] Update an existing account's name, offbudget status, account group, or attached note.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string", description: "Account UUID" },
         name: { type: "string", description: "New account name" },
         offbudget: { type: "boolean", description: "New offbudget status" },
+        account_group_id: { type: ["string", "null"], description: "New account group UUID (or null/empty to ungroup)" },
+        note: { type: ["string", "null"], description: "Account note text (or empty string to clear)" },
         args: { type: "array", items: { type: "string" } }
       },
       required: ["id"]
@@ -2191,7 +2911,64 @@ export const MCP_TOOL_DEFINITIONS = [
       const cli = ["accounts", "update", input.id];
       if (input.name !== undefined) cli.push("--name", input.name);
       if (input.offbudget !== undefined) cli.push("--offbudget", String(input.offbudget));
+      if (input.account_group_id !== undefined || input["account-group-id"] !== undefined) {
+        const gid = input.account_group_id !== undefined ? input.account_group_id : input["account-group-id"];
+        cli.push("--account-group-id", gid === null ? "null" : String(gid));
+      }
+      if (input.note !== undefined) cli.push("--note", input.note === null ? "" : String(input.note));
       return cli;
+    }
+  },
+  {
+    name: "actual_create_account_group",
+    readOnly: false,
+    description: "[MUTATING] Create a new account group.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Account group name" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["account-groups", "create", ...input.args];
+      return ["account-groups", "create", "--name", input.name];
+    }
+  },
+  {
+    name: "actual_update_account_group",
+    readOnly: false,
+    description: "[MUTATING] Update an account group's name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account group UUID" },
+        name: { type: "string", description: "New account group name" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id", "name"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["account-groups", "update", ...input.args];
+      return ["account-groups", "update", input.id, "--name", input.name];
+    }
+  },
+  {
+    name: "actual_delete_account_group",
+    readOnly: false,
+    description: "[MUTATING] Delete an account group by ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Account group UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["account-groups", "delete", ...input.args];
+      return ["account-groups", "delete", input.id];
     }
   },
   {
@@ -2248,6 +3025,45 @@ export const MCP_TOOL_DEFINITIONS = [
     toCli: (input = {}) => {
       if (Array.isArray(input.args)) return ["accounts", "delete", ...input.args];
       return ["accounts", "delete", input.id];
+    }
+  },
+  {
+    name: "actual_load_budget",
+    readOnly: false,
+    description: "[MUTATING] Load an already-downloaded local budget by its local budget ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Local budget ID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "load", ...input.args];
+      return ["budgets", "load", input.id];
+    }
+  },
+  {
+    name: "actual_import_budget",
+    readOnly: false,
+    description: "[MUTATING] Import a budget archive file (Actual, YNAB4, or nYNAB) into Actual Budget.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "Local file path to the budget archive" },
+        type: { type: "string", enum: ["actual", "ynab4", "nynab"], description: "Import format type (default: 'actual')" },
+        filename: { type: "string", description: "Optional budget name/filename override" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["file"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["budgets", "import", ...input.args];
+      const cli = ["budgets", "import", "--file", input.file];
+      if (input.type) cli.push("--type", input.type);
+      if (input.filename) cli.push("--filename", input.filename);
+      return cli;
     }
   },
   {
@@ -2433,6 +3249,24 @@ export const MCP_TOOL_DEFINITIONS = [
     }
   },
   {
+    name: "actual_merge_transactions",
+    readOnly: false,
+    description: "[MUTATING] Merge two transactions into one (keeps one transaction and deletes the duplicate).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: ["array", "string"], description: "Array of two transaction UUIDs or comma-separated string 'id1,id2'" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["ids"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["transactions", "merge", ...input.args];
+      const ids = Array.isArray(input.ids) ? input.ids : String(input.ids).split(",").map(s => s.trim()).filter(Boolean);
+      return ["transactions", "merge", ...ids];
+    }
+  },
+  {
     name: "actual_restore_transaction_notes",
     readOnly: false,
     description: "[MUTATING] Restore transaction notes for specified transaction IDs from backup.sqlite.",
@@ -2469,13 +3303,14 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: "actual_create_category",
     readOnly: false,
-    description: "[MUTATING] Create a new category.",
+    description: "[MUTATING] Create a new category with optional note.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "Category name" },
         group_id: { type: "string", description: "Parent category group UUID" },
         is_income: { type: "boolean", description: "Whether category is income (default: false)" },
+        note: { type: "string", description: "Optional initial note attached to the category" },
         args: { type: "array", items: { type: "string" } }
       },
       required: ["name", "group_id"]
@@ -2484,19 +3319,22 @@ export const MCP_TOOL_DEFINITIONS = [
       if (Array.isArray(input.args)) return ["categories", "create", ...input.args];
       const cli = ["categories", "create", "--name", input.name, "--group-id", input.group_id || input["group-id"]];
       if (input.is_income || input["is-income"]) cli.push("--is-income");
+      if (input.note !== undefined) cli.push("--note", input.note === null ? "" : String(input.note));
       return cli;
     }
   },
   {
     name: "actual_update_category",
     readOnly: false,
-    description: "[MUTATING] Update a category's name or hidden status.",
+    description: "[MUTATING] Update a category's name, hidden status, group_id, or attached note.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string", description: "Category UUID" },
         name: { type: "string", description: "New category name" },
         hidden: { type: "boolean", description: "Hidden flag" },
+        group_id: { type: "string", description: "New parent category group UUID" },
+        note: { type: ["string", "null"], description: "Category note text (or empty string to clear)" },
         args: { type: "array", items: { type: "string" } }
       },
       required: ["id"]
@@ -2506,6 +3344,10 @@ export const MCP_TOOL_DEFINITIONS = [
       const cli = ["categories", "update", input.id];
       if (input.name !== undefined) cli.push("--name", input.name);
       if (input.hidden !== undefined) cli.push("--hidden", String(input.hidden));
+      if (input.group_id !== undefined || input["group-id"] !== undefined) {
+        cli.push("--group-id", input.group_id ?? input["group-id"]);
+      }
+      if (input.note !== undefined) cli.push("--note", input.note === null ? "" : String(input.note));
       return cli;
     }
   },
@@ -2660,6 +3502,42 @@ export const MCP_TOOL_DEFINITIONS = [
       if (Array.isArray(input.args)) return ["payees", "merge", ...input.args];
       const ids = Array.isArray(input.ids) ? input.ids.join(",") : input.ids;
       return ["payees", "merge", "--target", input.target, "--ids", ids];
+    }
+  },
+  {
+    name: "actual_create_payee_location",
+    readOnly: false,
+    description: "[MUTATING] Create a geographic location for a payee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        payee_id: { type: "string", description: "Payee UUID" },
+        latitude: { type: "number", description: "Latitude coordinate" },
+        longitude: { type: "number", description: "Longitude coordinate" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["payee_id", "latitude", "longitude"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "location-create", ...input.args];
+      return ["payees", "location-create", "--payee-id", input.payee_id || input["payee-id"], "--latitude", String(input.latitude), "--longitude", String(input.longitude)];
+    }
+  },
+  {
+    name: "actual_delete_payee_location",
+    readOnly: false,
+    description: "[MUTATING] Delete a payee geographic location by ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Payee location UUID" },
+        args: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"]
+    },
+    toCli: (input = {}) => {
+      if (Array.isArray(input.args)) return ["payees", "location-delete", ...input.args];
+      return ["payees", "location-delete", input.id];
     }
   },
   {
