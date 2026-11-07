@@ -585,15 +585,17 @@ export function listReceipts(opts = {}) {
   const conditions = [];
   const params = [];
 
-  if (opts.tx_id) {
+  const tx_id = opts["tx-id"] || opts.tx_id;
+  if (tx_id) {
     conditions.push("(tx_id = ? OR tx_id_transfer = ?)");
-    params.push(opts.tx_id, opts.tx_id);
+    params.push(tx_id, tx_id);
   }
 
-  if (opts.tx_ids) {
-    const ids = Array.isArray(opts.tx_ids)
-      ? opts.tx_ids
-      : opts.tx_ids.split(",").map((s) => s.trim()).filter(Boolean);
+  const tx_ids = opts["tx-ids"] || opts.tx_ids;
+  if (tx_ids) {
+    const ids = Array.isArray(tx_ids)
+      ? tx_ids
+      : tx_ids.split(",").map((s) => s.trim()).filter(Boolean);
     if (ids.length > 0) {
       const placeholders = ids.map(() => "?").join(", ");
       conditions.push(`(tx_id IN (${placeholders}) OR tx_id_transfer IN (${placeholders}))`);
@@ -625,14 +627,16 @@ export function listReceipts(opts = {}) {
     params.push(opts.source);
   }
 
-  if (opts.source_ref) {
+  const source_ref = opts["source-ref"] || opts.source_ref;
+  if (source_ref) {
     conditions.push("source_ref = ?");
-    params.push(opts.source_ref);
+    params.push(source_ref);
   }
 
-  if (opts.source_hash) {
+  const source_hash = opts["source-hash"] || opts.source_hash;
+  if (source_hash) {
     conditions.push("source_hash = ?");
-    params.push(opts.source_hash);
+    params.push(source_hash);
   }
 
   if (opts.payee) {
@@ -645,14 +649,14 @@ export function listReceipts(opts = {}) {
     params.push(`%${opts.search}%`, `%${opts.search}%`, `%${opts.search}%`, `%${opts.search}%`);
   }
 
-  if (opts.exclude_ignored || opts.active_only) {
+  if (opts.exclude_ignored || opts["exclude-ignored"] || opts.active_only || opts["active-only"]) {
     conditions.push("(flag IS NULL OR flag NOT LIKE '%ignore%')");
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const limit = opts.limit !== undefined ? parseInt(opts.limit, 10) : 100;
   const offset = opts.offset !== undefined ? parseInt(opts.offset, 10) : 0;
-  const orderBy = opts.order_by || "date DESC, created DESC";
+  const orderBy = opts.order_by || opts["order-by"] || "date DESC, created DESC";
 
   const sql = `SELECT * FROM receipts ${whereClause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
   params.push(limit, offset);
@@ -1346,7 +1350,7 @@ export async function handleReceipts(subCmd, opts) {
     }
     case "for-transactions":
     case "by-transactions": {
-      const tx_ids = opts.tx_ids || (opts._positional ? opts._positional : []);
+      const tx_ids = opts["tx-ids"] || opts.tx_ids || (opts._positional ? opts._positional : []);
       const ids = Array.isArray(tx_ids) ? tx_ids : String(tx_ids).split(",").map(s => s.trim()).filter(Boolean);
       const map = getReceiptsForTransactions(ids);
       return Object.fromEntries(map);
