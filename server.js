@@ -4186,10 +4186,10 @@ async function run() {
   let isHealthy = true;
   const args = parseArgs(process.argv.slice(2));
 
-  const rawPort = args.port || process.env.PORT;
+  const rawPort = args.port || process.env.BIND_PORT || process.env.PORT;
   if (rawPort) {
     const port = parseIntFlag(rawPort, "port");
-    const rawHost = args.host || process.env.HOST || "127.0.0.1";
+    const rawHost = args.host || process.env.BIND_HOST || process.env.HOST || "127.0.0.1";
     const hosts = [...new Set(String(rawHost).split(",").map(h => h.trim()).filter(Boolean))];
     const isAuthDisabled =
       args["no-auth"] === true || args["no-auth"] === "true" ||
