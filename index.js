@@ -1,6 +1,11 @@
 import net from 'node:net';
 import dns from 'node:dns';
 
+// Load .env file if available (e.g. on Windows Scheduled Tasks where env is not pre-injected)
+try {
+  process.loadEnvFile?.();
+} catch {}
+
 // Disable Happy Eyeballs / network family autoselection and prefer IPv4.
 // Prevents connection timeouts when remote hosts advertise AAAA records (e.g. Pikapod)
 // but local routing/ISP cannot reach the IPv6 destination.
