@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 function loadFallbackEnv() {
   const candidateEnvPaths = [
     path.join(__dirname, ".env"),
-    path.join(__dirname, "..", "actual-utils", ".env"),
+    path.join(__dirname, "..", "finance-dash", ".env"),
     path.join(__dirname, "..", "actual-orch", ".env"),
   ];
 
