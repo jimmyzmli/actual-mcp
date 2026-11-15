@@ -1,7 +1,7 @@
 {
   "name": "actual-mcp",
   "version": "2.0.0",
-  "description": "Model Context Protocol (MCP) server for Actual Budget with Streamable HTTP, OAuth2, and Stdio support",
+  "description": "Model Context Protocol (MCP) server for Actual Budget with Streamable HTTP and Stdio support",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

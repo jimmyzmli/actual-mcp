@@ -19,7 +19,6 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
 import express from "express";
 import cors from "cors";
 import {
@@ -28,13 +27,6 @@ import {
   ListPromptsRequestSchema, GetPromptRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import {
-  oauthMiddleware,
-  setupOAuthRoutes,
-  OAUTH_CLIENT_ID,
-  validateOAuthConfig
-} from "./oauth.js";
-import {
-  authStorage,
   logCommand,
   logMessage,
   LOG_DIR,
@@ -3935,7 +3927,7 @@ const MCP_TOOL_MAP = new Map(MCP_TOOL_DEFINITIONS.map(t => [t.name, t]));
 let commandQueue = Promise.resolve();
 
 async function handleExecuteTool(name, toolInput, explicitClientId = null) {
-  const currentClientId = explicitClientId !== null ? explicitClientId : (authStorage.getStore()?.clientId || null);
+  const currentClientId = explicitClientId;
   let cliArgs = [];
 
   const toolDef = MCP_TOOL_MAP.get(name);
@@ -4185,8 +4177,7 @@ This server provides tools to query and mutate Actual Budget entities via the of
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    const currentClientId = authStorage.getStore()?.clientId || null;
-    return handleExecuteTool(name, args, currentClientId);
+    return handleExecuteTool(name, args);
   });
 
   return server;
@@ -4206,13 +4197,6 @@ async function run() {
     const port = parseIntFlag(rawPort, "port");
     const rawHost = args.host || process.env.BIND_HOST || process.env.HOST || "127.0.0.1";
     const hosts = [...new Set(String(rawHost).split(",").map(h => h.trim()).filter(Boolean))];
-    const isAuthDisabled =
-      args["no-auth"] === true || args["no-auth"] === "true" ||
-      args["noauth"] === true || args["noauth"] === "true" ||
-      args["no-oauth"] === true || args["no-oauth"] === "true" ||
-      args["auth"] === false || args["auth"] === "false" ||
-      process.env.NO_AUTH === "true";
-    const enableAuth = !isAuthDisabled;
 
     const app = express();
     app.disable('x-powered-by');
@@ -4225,21 +4209,13 @@ async function run() {
     app.use(cors({
       origin: false,  // Deny browser cross-origin requests; MCP calls don't use CORS
       methods: ['GET', 'POST', 'DELETE'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Mcp-Session-Id'],
+      allowedHeaders: ['Content-Type', 'Accept', 'Mcp-Session-Id'],
     }));
     app.use(express.json({ limit: '1mb' }));
     app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-
-    // ─── Setup OAuth2 Discovery and Endpoints ───
-    if (enableAuth) {
-      validateOAuthConfig();
-      setupOAuthRoutes(app);
-    }
-
     // Per-session transport map — supports multiple concurrent clients
     const transports = new Map();
-    const sessionClients = new Map();
 
     // ─── Health Check Endpoint ───
     app.get("/health", (req, res) => {
@@ -4252,166 +4228,132 @@ async function run() {
 
     // ─── Streamable HTTP Transport (protocol version 2025-11-25) ───
     // Stateless mode — each POST is self-contained, no session to manage.
-    const mcpMiddleware = enableAuth ? [oauthMiddleware] : [];
-    app.all("/mcp", ...mcpMiddleware, async (req, res) => {
+    app.all("/mcp", async (req, res) => {
       const sessionId = req.headers['mcp-session-id'];
-      const clientId = req.oauthUser?.clientId || (sessionId ? sessionClients.get(sessionId) : null) || null;
-      if (sessionId && req.oauthUser?.clientId) {
-        sessionClients.set(sessionId, req.oauthUser.clientId);
-      }
-      return authStorage.run({ clientId }, async () => {
-        try {
-          // Check for existing session
-          let transport;
+      try {
+        // Check for existing session
+        let transport;
 
-          if (sessionId && transports.has(sessionId)) {
-            const existing = transports.get(sessionId);
-            if (existing instanceof StreamableHTTPServerTransport) {
-              transport = existing;
-            } else if (existing instanceof SSEServerTransport) {
-              await existing.handlePostMessage(req, res, req.body);
-              return;
-            } else {
-              res.status(400).json({
-                jsonrpc: '2.0',
-                error: { code: -32000, message: 'Session exists but uses a different transport protocol' },
-                id: null
-              });
-              return;
-            }
-          } else if (sessionId && !transports.has(sessionId)) {
-            // Rehydrate StreamableHTTP session after server restart so existing clients continue working seamlessly
-            transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: () => sessionId,
-            });
-            if (!isInitializeRequest(req.body)) {
-              transport._webStandardTransport.sessionId = sessionId;
-              transport._webStandardTransport._initialized = true;
-            }
-            transports.set(sessionId, transport);
-            if (clientId) {
-              sessionClients.set(sessionId, clientId);
-            }
-            transport.onclose = () => {
-              const sid = transport.sessionId;
-              if (sid && transports.has(sid)) {
-                transports.delete(sid);
-                sessionClients.delete(sid);
-                console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
-              }
-            };
-            const server = createServer();
-            await server.connect(transport);
-            const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
-            console.error(`[StreamableHTTP] ${clientPrefix}Rehydrated session: ${sessionId} (${transports.size} active)`);
-          } else if (!sessionId && req.method === 'GET' && (req.headers['accept']?.includes('text/event-stream') || req.path === '/sse')) {
-            // Standalone SSE stream request (e.g. from IDE or older SSE clients)
-            const sseTransport = new SSEServerTransport("/messages", res);
-            const sid = sseTransport.sessionId;
-            transports.set(sid, sseTransport);
-            if (clientId) {
-              sessionClients.set(sid, clientId);
-            }
-            const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
-            console.error(`[SSE] ${clientPrefix}New session: ${sid} (${transports.size} active)`);
-
-            res.on('close', () => {
-              transports.delete(sid);
-              sessionClients.delete(sid);
-              console.error(`[SSE] Session closed: ${sid} (${transports.size} active)`);
-            });
-
-            const server = createServer();
-            await server.connect(sseTransport);
+        if (sessionId && transports.has(sessionId)) {
+          const existing = transports.get(sessionId);
+          if (existing instanceof StreamableHTTPServerTransport) {
+            transport = existing;
+          } else if (existing instanceof SSEServerTransport) {
+            await existing.handlePostMessage(req, res, req.body);
             return;
-          } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
-            // New Streamable HTTP session
-            transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: () => randomUUID(),
-              onsessioninitialized: (sid) => {
-                transports.set(sid, transport);
-                if (clientId) {
-                  sessionClients.set(sid, clientId);
-                }
-                const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
-                console.error(`[StreamableHTTP] ${clientPrefix}New session: ${sid} (${transports.size} active)`);
-              }
-            });
-
-            transport.onclose = () => {
-              const sid = transport.sessionId;
-              if (sid && transports.has(sid)) {
-                transports.delete(sid);
-                sessionClients.delete(sid);
-                console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
-              }
-            };
-
-            const server = createServer();
-            await server.connect(transport);
           } else {
             res.status(400).json({
               jsonrpc: '2.0',
-              error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+              error: { code: -32000, message: 'Session exists but uses a different transport protocol' },
               id: null
             });
             return;
           }
-
-          await transport.handleRequest(req, res, req.body);
-        } catch (error) {
-          console.error('Error handling Streamable HTTP request:', error);
-          if (!res.headersSent) {
-            res.status(500).json({
-              jsonrpc: '2.0',
-              error: { code: -32603, message: 'Internal server error' },
-              id: null
-            });
+        } else if (sessionId && !transports.has(sessionId)) {
+          // Rehydrate StreamableHTTP session after server restart so existing clients continue working seamlessly
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => sessionId,
+          });
+          if (!isInitializeRequest(req.body)) {
+            transport._webStandardTransport.sessionId = sessionId;
+            transport._webStandardTransport._initialized = true;
           }
-        }
-      });
-    });
+          transports.set(sessionId, transport);
+          transport.onclose = () => {
+            const sid = transport.sessionId;
+            if (sid && transports.has(sid)) {
+              transports.delete(sid);
+              console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
+            }
+          };
+          const server = createServer();
+          await server.connect(transport);
+          console.error(`[StreamableHTTP] Rehydrated session: ${sessionId} (${transports.size} active)`);
+        } else if (!sessionId && req.method === 'GET' && (req.headers['accept']?.includes('text/event-stream') || req.path === '/sse')) {
+          // Standalone SSE stream request (e.g. from IDE or older SSE clients)
+          const sseTransport = new SSEServerTransport("/messages", res);
+          const sid = sseTransport.sessionId;
+          transports.set(sid, sseTransport);
+          console.error(`[SSE] New session: ${sid} (${transports.size} active)`);
 
-    // ─── SSE Transport (protocol version 2024-11-05) ───
-    app.get("/sse", ...mcpMiddleware, async (req, res) => {
-      const sessionId = req.headers['mcp-session-id'];
-      const clientId = req.oauthUser?.clientId || (sessionId ? sessionClients.get(sessionId) : null) || null;
-      return authStorage.run({ clientId }, async () => {
-        const transport = new SSEServerTransport("/messages", res);
-        const sid = transport.sessionId;
-        transports.set(sid, transport);
-        if (clientId) {
-          sessionClients.set(sid, clientId);
-        }
-        const clientPrefix = req.oauthUser?.clientId ? `[Client: ${req.oauthUser.clientId}] ` : "";
-        console.error(`[SSE] ${clientPrefix}New session on /sse: ${sid} (${transports.size} active)`);
+          res.on('close', () => {
+            transports.delete(sid);
+            console.error(`[SSE] Session closed: ${sid} (${transports.size} active)`);
+          });
 
-        res.on('close', () => {
-          transports.delete(sid);
-          sessionClients.delete(sid);
-          console.error(`[SSE] Session closed: ${sid} (${transports.size} active)`);
-        });
+          const server = createServer();
+          await server.connect(sseTransport);
+          return;
+        } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
+          // New Streamable HTTP session
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid) => {
+              transports.set(sid, transport);
+              console.error(`[StreamableHTTP] New session: ${sid} (${transports.size} active)`);
+            }
+          });
 
-        const server = createServer();
-        await server.connect(transport);
-      });
-    });
+          transport.onclose = () => {
+            const sid = transport.sessionId;
+            if (sid && transports.has(sid)) {
+              transports.delete(sid);
+              console.error(`[StreamableHTTP] Session closed: ${sid} (${transports.size} active)`);
+            }
+          };
 
-    app.post("/messages", ...mcpMiddleware, async (req, res) => {
-      const sessionId = req.query.sessionId || req.headers['mcp-session-id'];
-      const clientId = req.oauthUser?.clientId || (sessionId ? sessionClients.get(sessionId) : null) || null;
-      return authStorage.run({ clientId }, async () => {
-        const transport = transports.get(sessionId);
-        if (transport && transport instanceof SSEServerTransport) {
-          await transport.handlePostMessage(req, res, req.body);
+          const server = createServer();
+          await server.connect(transport);
         } else {
           res.status(400).json({
             jsonrpc: '2.0',
-            error: { code: -32000, message: 'No active SSE session found for sessionId' },
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: null
+          });
+          return;
+        }
+
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        console.error('Error handling Streamable HTTP request:', error);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
             id: null
           });
         }
+      }
+    });
+
+    // ─── SSE Transport (protocol version 2024-11-05) ───
+    app.get("/sse", async (req, res) => {
+      const transport = new SSEServerTransport("/messages", res);
+      const sid = transport.sessionId;
+      transports.set(sid, transport);
+      console.error(`[SSE] New session on /sse: ${sid} (${transports.size} active)`);
+
+      res.on('close', () => {
+        transports.delete(sid);
+        console.error(`[SSE] Session closed: ${sid} (${transports.size} active)`);
       });
+
+      const server = createServer();
+      await server.connect(transport);
+    });
+
+    app.post("/messages", async (req, res) => {
+      const sessionId = req.query.sessionId || req.headers['mcp-session-id'];
+      const transport = transports.get(sessionId);
+      if (transport && transport instanceof SSEServerTransport) {
+        await transport.handlePostMessage(req, res, req.body);
+      } else {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'No active SSE session found for sessionId' },
+          id: null
+        });
+      }
     });
 
     const activeServers = [];
@@ -4423,12 +4365,6 @@ async function run() {
         console.error(`[Actual MCP] Warning: Failed to bind on ${host}:${port}: ${err.message}`);
       });
       activeServers.push(serverInstance);
-    }
-    if (enableAuth) {
-      console.error(`[OAuth] OAuth2 protection enabled (Client ID: ${OAUTH_CLIENT_ID})`);
-      console.error(`[OAuth] Discovery: http://localhost:${port}/.well-known/oauth-authorization-server`);
-    } else {
-      console.error(`[OAuth] OAuth2 protection disabled via flag`);
     }
   } else {
     const server = createServer();

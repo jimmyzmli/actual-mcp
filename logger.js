@@ -2,7 +2,6 @@ import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { AsyncLocalStorage } from "node:async_hooks";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,8 +9,6 @@ const __dirname = path.dirname(__filename);
 export const LOG_DIR = path.join(__dirname, "logs");
 export const COMMAND_LOG_FILE = path.join(LOG_DIR, "actual-commands.log");
 export const PID_LOG_FILE = path.join(LOG_DIR, `${process.pid}.log`);
-
-export const authStorage = new AsyncLocalStorage();
 
 export function getLocalTimestamp() {
   const now = new Date();
@@ -87,9 +84,7 @@ async function appendToFile(filePath, content) {
  * Log commands to logs/actual-commands.log (only commands, no timing/system logs)
  */
 export async function logCommand(cmd, explicitClientId = null) {
-  const store = authStorage.getStore();
-  const clientId = explicitClientId !== null ? explicitClientId : (store?.clientId || null);
-  const line = formatLogEntry(cmd, clientId);
+  const line = formatLogEntry(cmd, explicitClientId);
   await appendToFile(COMMAND_LOG_FILE, line);
 }
 
@@ -97,8 +92,6 @@ export async function logCommand(cmd, explicitClientId = null) {
  * Log all other system, error, and status messages to logs/[pid].log
  */
 export async function logMessage(msg, explicitClientId = null) {
-  const store = authStorage.getStore();
-  const clientId = explicitClientId !== null ? explicitClientId : (store?.clientId || null);
-  const line = formatLogEntry(msg, clientId);
+  const line = formatLogEntry(msg, explicitClientId);
   await appendToFile(PID_LOG_FILE, line);
 }
