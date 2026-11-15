@@ -68,6 +68,10 @@ try {
 
 const ACTUAL_RC_PATH = process.env.ACTUAL_RC_PATH || path.join(os.homedir(), '.actualrc.json');
 const ACTUAL_DATA_ROOT = process.env.ACTUAL_DATA_DIR || path.join(os.homedir(), '.actual-data');
+const GATEWAY_URL = (
+  process.env.GATEWAY_URL ||
+  (os.platform() === 'darwin' ? 'http://pc.lzn.ca:9999' : 'http://127.0.0.1:9999')
+).replace(/\/+$/, '');
 if (!fsSync.existsSync(ACTUAL_DATA_ROOT)) {
   fsSync.mkdirSync(ACTUAL_DATA_ROOT, { recursive: true });
 }
@@ -119,6 +123,23 @@ async function loadApi() {
 }
 
 async function readActualRc() {
+  const config = {};
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/api/actual/token`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.server_url) config.serverUrl = data.server_url;
+      if (data.password) config.password = data.password;
+      if (data.sync_id) config.syncId = data.sync_id;
+      if (data.encryption_password) config.encryptionPassword = data.encryption_password;
+      return config;
+    }
+  } catch (e) {
+    // Fallback to ~/.actualrc.json or env vars if gateway-mcp is unreachable
+  }
+
   try {
     const data = await fs.readFile(ACTUAL_RC_PATH, 'utf8');
     return JSON.parse(data);
