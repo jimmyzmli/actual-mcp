@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
@@ -42,10 +43,12 @@ function loadFallbackEnv() {
 
 loadFallbackEnv();
 
-const PB_BASE_URL = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || "https://pb.lzn.ca").replace(/\/+$/, "");
-const PB_USER = process.env.PB_USER || "actual_orch@lizen.org";
-const PB_PASSWORD = process.env.PB_PASSWORD || "t3xiKBWd6JpM3F";
-const PB_API_TOKEN = process.env.PB_API_TOKEN || "t9arjlT4M7oeg0JEeRD9fbnVNaC4T%9GOaA7AgFa4pnl@V9BaIh6*Mdz9IN7t9o#";
+const GATEWAY_URL = (
+  process.env.GATEWAY_URL ||
+  (os.platform() === "darwin" ? "http://pc.lzn.ca:9999" : "http://127.0.0.1:9999")
+).replace(/\/+$/, "");
+let PB_BASE_URL = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || "https://pb.lzn.ca").replace(/\/+$/, "");
+let PB_API_TOKEN = process.env.PB_API_TOKEN || null;
 
 // ─── Local SQLite Database Setup ───
 const CACHE_DIR = path.join(__dirname, "cache");
@@ -156,28 +159,24 @@ async function getAuthToken() {
     return cachedToken;
   }
 
-  // Try user/password authentication
-  if (PB_USER && PB_PASSWORD) {
-    try {
-      const resp = await fetch(`${PB_BASE_URL}/api/collections/users/auth-with-password`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ identity: PB_USER, password: PB_PASSWORD }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.token) {
-          cachedToken = data.token;
-          tokenExpiry = now + 7 * 24 * 3600 * 1000; // default 7 days
-          return cachedToken;
-        }
-      }
-    } catch (err) {
-      console.error(`[PocketBase] Password auth failed, falling back to API token: ${err.message}`);
-    }
+  const resp = await fetch(`${GATEWAY_URL}/api/pocketbase/token?role=actual_orch`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch PocketBase token from gateway-mcp (HTTP ${resp.status})`);
   }
-
-  return PB_API_TOKEN;
+  const data = await resp.json();
+  if (data.base_url) PB_BASE_URL = String(data.base_url).replace(/\/+$/, "");
+  if (data.api_token) PB_API_TOKEN = data.api_token;
+  if (data.token) {
+    cachedToken = data.token;
+    tokenExpiry = data.expires_at ? Number(data.expires_at) * 1000 : now + 3600 * 1000;
+    return cachedToken;
+  }
+  if (PB_API_TOKEN) {
+    return PB_API_TOKEN;
+  }
+  throw new Error("PocketBase token missing in gateway-mcp /api/pocketbase/token response");
 }
 
 async function pbRequest(endpoint, options = {}) {

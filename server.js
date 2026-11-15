@@ -66,7 +66,6 @@ try {
   // Ignore
 }
 
-const ACTUAL_RC_PATH = process.env.ACTUAL_RC_PATH || path.join(os.homedir(), '.actualrc.json');
 const ACTUAL_DATA_ROOT = process.env.ACTUAL_DATA_DIR || path.join(os.homedir(), '.actual-data');
 const GATEWAY_URL = (
   process.env.GATEWAY_URL ||
@@ -123,45 +122,38 @@ async function loadApi() {
 }
 
 async function readActualRc() {
-  const config = {};
-  try {
-    const resp = await fetch(`${GATEWAY_URL}/api/actual/token`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.server_url) config.serverUrl = data.server_url;
-      if (data.password) config.password = data.password;
-      if (data.sync_id) config.syncId = data.sync_id;
-      if (data.encryption_password) config.encryptionPassword = data.encryption_password;
-      return config;
-    }
-  } catch (e) {
-    // Fallback to ~/.actualrc.json or env vars if gateway-mcp is unreachable
+  const resp = await fetch(`${GATEWAY_URL}/api/actual/token`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch Actual config from ${GATEWAY_URL}/api/actual/token (HTTP ${resp.status})`);
   }
-
-  try {
-    const data = await fs.readFile(ACTUAL_RC_PATH, 'utf8');
-    return JSON.parse(data);
-  } catch (e) {
-    return {};
+  const data = await resp.json();
+  if (!data.server_url || !data.sync_id) {
+    throw new Error(`Incomplete Actual config returned by ${GATEWAY_URL}/api/actual/token`);
   }
+  return {
+    serverUrl: data.server_url,
+    password: data.password,
+    syncId: data.sync_id,
+    encryptionPassword: data.encryption_password,
+  };
 }
 
 function getServerUrl() {
-  return process.env.ACTUAL_SERVER_URL || rcConfig?.serverUrl;
+  return rcConfig?.serverUrl;
 }
 
 function getServerPassword() {
-  return process.env.ACTUAL_PASSWORD || rcConfig?.password;
+  return rcConfig?.password;
 }
 
 function getSyncId() {
-  return process.env.ACTUAL_SYNC_ID || rcConfig?.syncId;
+  return rcConfig?.syncId;
 }
 
 function getEncryptionPassword() {
-  return process.env.ACTUAL_ENCRYPTION_PASSWORD || rcConfig?.encryptionPassword;
+  return rcConfig?.encryptionPassword;
 }
 
 async function ensureInit() {
@@ -197,7 +189,7 @@ async function ensureBudget() {
   const encryptionPassword = getEncryptionPassword();
 
   if (!syncId) {
-    throw new Error('syncId not found in .actualrc.json or ACTUAL_SYNC_ID environment variable — cannot load budget');
+    throw new Error('sync_id not found in gateway-mcp /api/actual/token response — cannot load budget');
   }
 
   try {
@@ -4204,6 +4196,8 @@ This server provides tools to query and mutate Actual Budget entities via the of
 // Startup
 // ───────────────────────────────────────────────────────────
 async function run() {
+  // Fetch Actual Budget credentials from gateway-mcp on startup; fail fast if unavailable
+  rcConfig = await readActualRc();
   let isHealthy = true;
   const args = parseArgs(process.argv.slice(2));
 
@@ -4463,5 +4457,8 @@ const isDirectExecution = !process.argv[1] || (
 );
 
 if (isDirectExecution) {
-  run().catch(console.error);
+  run().catch((err) => {
+    console.error(`[Actual MCP] Fatal startup error: ${err.message}`);
+    process.exit(1);
+  });
 }
