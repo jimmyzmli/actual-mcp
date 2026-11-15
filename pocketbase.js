@@ -153,6 +153,11 @@ function getUpsertStmt() {
 let cachedToken = null;
 let tokenExpiry = 0;
 
+export function invalidatePocketBaseTokenCache() {
+  cachedToken = null;
+  tokenExpiry = 0;
+}
+
 async function getAuthToken() {
   const now = Date.now();
   if (cachedToken && tokenExpiry > now + 60000) {

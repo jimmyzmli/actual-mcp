@@ -33,7 +33,8 @@ import {
   PID_LOG_FILE,
   COMMAND_LOG_FILE,
 } from "./logger.js";
-import { handleReceipts, queryReceipts, enrichTransactionsWithReceipts } from "./pocketbase.js";
+import { handleReceipts, queryReceipts, enrichTransactionsWithReceipts, invalidatePocketBaseTokenCache } from "./pocketbase.js";
+import { connect as connectNats } from "nats";
 
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -4186,9 +4187,41 @@ This server provides tools to query and mutate Actual Budget entities via the of
 // ───────────────────────────────────────────────────────────
 // Startup
 // ───────────────────────────────────────────────────────────
+async function startNatsTokenSubscriber() {
+  const natsUrl = process.env.NATS_URL || (os.platform() === 'darwin' ? 'nats://pc.lzn.ca:4222' : 'nats://127.0.0.1:4222');
+  try {
+    const nc = await connectNats({
+      servers: natsUrl,
+      name: 'actual-mcp',
+      reconnect: true,
+      maxReconnectAttempts: -1,
+      reconnectTimeWait: 2000,
+    });
+    const subPb = nc.subscribe('api.pocketbase.refreshed');
+    (async () => {
+      for await (const _ of subPb) {
+        invalidatePocketBaseTokenCache();
+      }
+    })().catch(() => {});
+    const subActual = nc.subscribe('api.actual.refreshed');
+    (async () => {
+      for await (const _ of subActual) {
+        try {
+          rcConfig = await readActualRc();
+        } catch (err) {
+          console.error(`[Actual MCP] Failed to refresh Actual config on api.actual.refreshed: ${err.message}`);
+        }
+      }
+    })().catch(() => {});
+  } catch (err) {
+    console.error(`[Actual MCP] NATS connection failed (${natsUrl}): ${err.message}`);
+  }
+}
+
 async function run() {
   // Fetch Actual Budget credentials from gateway-mcp on startup; fail fast if unavailable
   rcConfig = await readActualRc();
+  void startNatsTokenSubscriber();
   let isHealthy = true;
   const args = parseArgs(process.argv.slice(2));
 
