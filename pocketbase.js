@@ -1,52 +1,12 @@
 import path from "node:path";
 import fs from "node:fs";
-import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
+import { getConfigProvider } from "./mcp_server/providers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Helper to load env variables from candidate paths if not already in process.env
-function loadFallbackEnv() {
-  const candidateEnvPaths = [
-    path.join(__dirname, ".env"),
-    path.join(__dirname, "..", "finance-dash", ".env"),
-    path.join(__dirname, "..", "actual-orch", ".env"),
-  ];
-
-  for (const envPath of candidateEnvPaths) {
-    if (fs.existsSync(envPath)) {
-      try {
-        const content = fs.readFileSync(envPath, "utf-8");
-        for (const line of content.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith("#")) continue;
-          const eqIdx = trimmed.indexOf("=");
-          if (eqIdx !== -1) {
-            const key = trimmed.slice(0, eqIdx).trim();
-            let val = trimmed.slice(eqIdx + 1).trim();
-            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-              val = val.slice(1, -1);
-            }
-            if (!process.env[key]) {
-              process.env[key] = val;
-            }
-          }
-        }
-      } catch (e) {
-        // Ignore read errors
-      }
-    }
-  }
-}
-
-loadFallbackEnv();
-
-const GATEWAY_URL = (
-  process.env.GATEWAY_URL ||
-  (os.platform() === "darwin" ? "http://pc.lzn.ca:9999" : "http://127.0.0.1:9999")
-).replace(/\/+$/, "");
 let PB_BASE_URL = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || "https://pb.lzn.ca").replace(/\/+$/, "");
 let PB_API_TOKEN = process.env.PB_API_TOKEN || null;
 
@@ -149,39 +109,17 @@ function getUpsertStmt() {
   return _upsertStmt;
 }
 
-// ─── Auth State ───
-let cachedToken = null;
-let tokenExpiry = 0;
-
 export function invalidatePocketBaseTokenCache() {
-  cachedToken = null;
-  tokenExpiry = 0;
+  getConfigProvider().invalidatePocketBaseToken?.();
 }
 
 async function getAuthToken() {
-  const now = Date.now();
-  if (cachedToken && tokenExpiry > now + 60000) {
-    return cachedToken;
-  }
-
-  const resp = await fetch(`${GATEWAY_URL}/api/pocketbase/token?role=actual_orch`, {
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!resp.ok) {
-    throw new Error(`Failed to fetch PocketBase token from gateway-mcp (HTTP ${resp.status})`);
-  }
-  const data = await resp.json();
-  if (data.base_url) PB_BASE_URL = String(data.base_url).replace(/\/+$/, "");
-  if (data.api_token) PB_API_TOKEN = data.api_token;
-  if (data.token) {
-    cachedToken = data.token;
-    tokenExpiry = data.expires_at ? Number(data.expires_at) * 1000 : now + 3600 * 1000;
-    return cachedToken;
-  }
-  if (PB_API_TOKEN) {
-    return PB_API_TOKEN;
-  }
-  throw new Error("PocketBase token missing in gateway-mcp /api/pocketbase/token response");
+  const auth = await getConfigProvider().getPocketBaseAuth();
+  if (auth?.baseUrl) PB_BASE_URL = String(auth.baseUrl).replace(/\/+$/, "");
+  if (auth?.apiToken !== undefined) PB_API_TOKEN = auth.apiToken;
+  if (auth?.token) return auth.token;
+  if (PB_API_TOKEN) return PB_API_TOKEN;
+  throw new Error("PocketBase token unavailable from active ConfigProvider");
 }
 
 async function pbRequest(endpoint, options = {}) {
@@ -299,13 +237,58 @@ function upsertReceiptSqlite(rec) {
   );
 }
 
-// ─── Sync Receipts into SQLite (Full or Incremental) ───
+// ─── Sync Receipts into SQLite (Single-ID Refresh, Full, Incremental, or Initial-If-Empty) ───
 export async function syncReceipts(options = {}) {
   const startTime = Date.now();
+  const targetId = options.id || options.receipt_id || options.receiptId;
+  if (targetId) {
+    try {
+      const rec = await pbRequest(`/api/collections/receipts/records/${encodeURIComponent(String(targetId))}`);
+      if (rec && rec.id) {
+        upsertReceiptSqlite(rec);
+        try { db.exec(`PRAGMA wal_checkpoint(PASSIVE);`); } catch (e) {}
+        return {
+          success: true,
+          action: "upserted",
+          id: rec.id,
+          totalSaved: 1,
+          durationMs: Date.now() - startTime,
+        };
+      }
+    } catch (err) {
+      if (String(err.message || "").includes("[404")) {
+        db.prepare("DELETE FROM receipts WHERE id = ?").run(String(targetId));
+        try { db.exec(`PRAGMA wal_checkpoint(PASSIVE);`); } catch (e) {}
+        return {
+          success: true,
+          action: "deleted",
+          id: String(targetId),
+          totalSaved: 0,
+          durationMs: Date.now() - startTime,
+        };
+      }
+      throw err;
+    }
+  }
+
+  let isFull = !!options.full;
+  if (options.initial_if_empty) {
+    const row = db.prepare("SELECT COUNT(*) as count FROM receipts").get();
+    const imgRow = db.prepare("SELECT 1 FROM receipts WHERE image IS NOT NULL AND image != '[]' AND image != '' LIMIT 1").get();
+    if (row && row.count > 0 && imgRow) {
+      return {
+        success: true,
+        skipped: true,
+        reason: "cache_populated",
+        durationMs: Date.now() - startTime,
+      };
+    }
+    isFull = true;
+  }
+
   let page = 1;
   const perPage = options.perPage || 500;
   let totalSaved = 0;
-  const isFull = !!options.full;
 
   let filter = options.filter || "";
   if (!filter && !isFull) {
@@ -1185,113 +1168,6 @@ function buildWhereClause(filter) {
   };
 }
 
-// ─── Real-Time SSE Synchronization with PocketBase ───
-let realtimeAbortController = null;
-let realtimeReconnectTimer = null;
-
-export async function startRealtimeListener() {
-  if (realtimeAbortController) {
-    try { realtimeAbortController.abort(); } catch (e) {}
-  }
-  realtimeAbortController = new AbortController();
-  const { signal } = realtimeAbortController;
-
-  const connect = async () => {
-    if (signal.aborted) return;
-    try {
-      const token = await getAuthToken();
-      const headers = {};
-      if (token) {
-        if (token === PB_API_TOKEN) {
-          headers["x-api-token"] = token;
-        } else {
-          headers["Authorization"] = token;
-        }
-      }
-
-      const res = await fetch(`${PB_BASE_URL}/api/realtime`, {
-        headers,
-        signal,
-      });
-
-      if (!res.ok || !res.body) {
-        throw new Error(`Realtime connection failed: HTTP ${res.status}`);
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let clientId = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() || "";
-
-        for (const rawEvent of parts) {
-          const trimmed = rawEvent.trim();
-          if (!trimmed) continue;
-
-          const lines = trimmed.split("\n");
-          let eventType = "message";
-          let eventData = "";
-
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              eventType = line.slice(6).trim();
-            } else if (line.startsWith("data:")) {
-              eventData += line.slice(5).trim();
-            }
-          }
-
-          if (eventType === "PB_CONNECT") {
-            try {
-              const parsed = JSON.parse(eventData);
-              clientId = parsed.clientId;
-              // Subscribe to receipts collection
-              await fetch(`${PB_BASE_URL}/api/realtime`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", ...headers },
-                body: JSON.stringify({ clientId, subscriptions: ["receipts/*"] }),
-                signal,
-              });
-              console.error(`[PocketBase Realtime] Subscribed to receipts/* (clientId: ${clientId})`);
-            } catch (subErr) {
-              console.error(`[PocketBase Realtime] Subscription error: ${subErr.message}`);
-            }
-          } else if (eventData) {
-            try {
-              const payload = JSON.parse(eventData);
-              if (payload.action && payload.record) {
-                const action = payload.action;
-                const rec = payload.record;
-                if (action === "create" || action === "update") {
-                  upsertReceiptSqlite(rec);
-                  console.error(`[PocketBase Realtime] ${action} cached record ${rec.id}`);
-                } else if (action === "delete") {
-                  db.prepare("DELETE FROM receipts WHERE id = ?").run(rec.id);
-                  console.error(`[PocketBase Realtime] deleted cached record ${rec.id}`);
-                }
-              }
-            } catch (parseErr) {
-              // Ignore malformed event
-            }
-          }
-        }
-      }
-    } catch (err) {
-      if (!signal.aborted) {
-        console.error(`[PocketBase Realtime] Stream disconnected (${err.message}), reconnecting in 5s...`);
-        realtimeReconnectTimer = setTimeout(connect, 5000);
-      }
-    }
-  };
-
-  connect();
-}
-
 // ─── CLI Command Handler for receipts ───
 export async function handleReceipts(subCmd, opts) {
   switch (subCmd) {
@@ -1350,7 +1226,11 @@ export async function handleReceipts(subCmd, opts) {
       });
     }
     case "sync": {
-      return await syncReceipts({ full: !!opts.full });
+      return await syncReceipts({
+        full: !!opts.full,
+        id: opts.id || opts["receipt-id"] || opts.receipt_id,
+        initial_if_empty: !!(opts["initial-if-empty"] || opts.initial_if_empty),
+      });
     }
     case "for-transactions":
     case "by-transactions": {
@@ -1363,39 +1243,3 @@ export async function handleReceipts(subCmd, opts) {
       throw new Error(`Unknown receipts subcommand: "${subCmd}". Available: list, get, image, link, unlink, exists, save, delete, sync, for-transactions`);
   }
 }
-
-// Start real-time SSE listener in background
-startRealtimeListener().catch((err) => {
-  console.error(`[PocketBase Realtime] Init error: ${err.message}`);
-});
-
-// Periodic incremental sync every 15 minutes as safety net
-setInterval(() => {
-  syncReceipts({ incremental: true }).catch((err) => {
-    console.error(`[PocketBase Background Sync] Error: ${err.message}`);
-  });
-}, 15 * 60 * 1000);
-
-// Check if initial sync or migration sync is needed on import
-(async () => {
-  try {
-    const row = db.prepare("SELECT COUNT(*) as count FROM receipts").get();
-    if (!row || row.count === 0) {
-      console.error("[PocketBase] Local cache empty, triggering initial sync...");
-      syncReceipts({ full: true }).catch((err) => {
-        console.error(`[PocketBase] Background sync error: ${err.message}`);
-      });
-    } else {
-      // Check if image column is populated; if not, trigger a background full sync to backfill images
-      const imgRow = db.prepare("SELECT 1 FROM receipts WHERE image IS NOT NULL AND image != '[]' AND image != '' LIMIT 1").get();
-      if (!imgRow) {
-        console.error("[PocketBase] Image column unpopulated, triggering one-time background full sync...");
-        syncReceipts({ full: true }).catch((err) => {
-          console.error(`[PocketBase] Background migration sync error: ${err.message}`);
-        });
-      }
-    }
-  } catch (e) {
-    // Ignore
-  }
-})();
