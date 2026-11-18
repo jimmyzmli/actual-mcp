@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
+import util from "util";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -9,6 +10,10 @@ const __dirname = path.dirname(__filename);
 export const LOG_DIR = path.join(__dirname, "logs");
 export const COMMAND_LOG_FILE = path.join(LOG_DIR, "actual-commands.log");
 export const PID_LOG_FILE = path.join(LOG_DIR, `${process.pid}.log`);
+export const WEB_UI_LOG_FILE = path.join(LOG_DIR, "web-ui.log");
+
+let webUiTeeInstalled = false;
+let webUiLineCount = -1;
 
 export function getLocalTimestamp() {
   const now = new Date();
@@ -94,4 +99,74 @@ export async function logCommand(cmd, explicitClientId = null) {
 export async function logMessage(msg, explicitClientId = null) {
   const line = formatLogEntry(msg, explicitClientId);
   await appendToFile(PID_LOG_FILE, line);
+}
+
+function rotateLogSyncIfNeeded(logPath, maxLines = 2000) {
+  try {
+    if (!fsSync.existsSync(logPath)) {
+      webUiLineCount = 0;
+      return;
+    }
+    if (webUiLineCount < 0) {
+      const content = fsSync.readFileSync(logPath, "utf8");
+      let count = 0;
+      for (let i = 0; i < content.length; i++) {
+        if (content[i] === "\n") count++;
+      }
+      webUiLineCount = count;
+    }
+    if (webUiLineCount < maxLines) return;
+
+    const logDir = path.dirname(logPath);
+    const logFile = path.basename(logPath);
+    const files = fsSync.readdirSync(logDir);
+    let maxIdx = 0;
+    for (const file of files) {
+      if (file.startsWith(logFile + ".")) {
+        const num = parseInt(file.substring(logFile.length + 1), 10);
+        if (!isNaN(num) && num > maxIdx) maxIdx = num;
+      }
+    }
+    for (let i = maxIdx; i >= 1; i--) {
+      const oldLog = `${logPath}.${i}`;
+      const newLog = `${logPath}.${i + 1}`;
+      if (fsSync.existsSync(oldLog)) {
+        fsSync.renameSync(oldLog, newLog);
+      }
+    }
+    fsSync.renameSync(logPath, `${logPath}.1`);
+    webUiLineCount = 0;
+  } catch {
+    // Ignore rotation errors to avoid interfering with stderr output
+  }
+}
+
+function appendWebUiLineSync(args) {
+  try {
+    if (!fsSync.existsSync(LOG_DIR)) {
+      fsSync.mkdirSync(LOG_DIR, { recursive: true });
+    }
+    rotateLogSyncIfNeeded(WEB_UI_LOG_FILE);
+    const entry = formatLogEntry(util.format(...args));
+    fsSync.appendFileSync(WEB_UI_LOG_FILE, entry, "utf8");
+    for (let i = 0; i < entry.length; i++) {
+      if (entry[i] === "\n") webUiLineCount++;
+    }
+  } catch {
+    // Never throw from console tee
+  }
+}
+
+/**
+ * Mirror console.error output synchronously to logs/web-ui.log so startup and fatal crash logs
+ * are preserved when running under headless supervisors such as Windows Task Scheduler.
+ */
+export function installWebUiConsoleTee() {
+  if (webUiTeeInstalled) return;
+  webUiTeeInstalled = true;
+  const origError = console.error.bind(console);
+  console.error = (...args) => {
+    appendWebUiLineSync(args);
+    origError(...args);
+  };
 }

@@ -1,5 +1,8 @@
 import net from 'node:net';
 import dns from 'node:dns';
+import { installWebUiConsoleTee } from './logger.js';
+
+installWebUiConsoleTee();
 
 // Load .env file if available (e.g. on Windows Scheduled Tasks where env is not pre-injected)
 try {

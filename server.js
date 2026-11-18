@@ -16,6 +16,9 @@ import {
   startPocketBaseRealtimeSync,
 } from "./orchestrator/runner.js";
 import { InProcessToolCaller } from "./orchestrator/toolCaller.js";
+import { installWebUiConsoleTee } from "./logger.js";
+
+installWebUiConsoleTee();
 
 async function main() {
   const mcpOnly = process.argv.includes("--mcp-only");
@@ -26,7 +29,9 @@ async function main() {
     setConfigProvider(configProvider);
   }
 
-  await startServer({ failFastConfig: !mcpOnly });
+  // Never fail-fast on gateway-mcp at boot: Actual MCP and Gateway MCP share a PT3M boot trigger,
+  // and ensureInit() already resolves Actual config lazily on the first Actual API call.
+  await startServer({ failFastConfig: false });
 
   if (!mcpOnly && configProvider) {
     const toolCaller = new InProcessToolCaller(handleExecuteTool);
