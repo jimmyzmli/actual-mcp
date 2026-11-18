@@ -16,23 +16,27 @@ export async function startNatsTokenSubscriber(configProvider, { onActualRefresh
       reconnectTimeWait: 2000,
     });
 
-    const subPb = nc.subscribe("api.pocketbase.refreshed");
+    const subToken = nc.subscribe("api.token.refreshed");
     (async () => {
-      for await (const _ of subPb) {
-        configProvider.invalidatePocketBaseToken?.();
-      }
-    })().catch(() => {});
-
-    const subActual = nc.subscribe("api.actual.refreshed");
-    (async () => {
-      for await (const _ of subActual) {
+      for await (const msg of subToken) {
+        let provider = "";
         try {
-          configProvider.invalidateActualConfig?.();
-          if (onActualRefreshed) {
-            await onActualRefreshed();
+          const parsed = msg.data?.length ? JSON.parse(new TextDecoder().decode(msg.data)) : {};
+          provider = String(parsed?.provider || "").trim().toLowerCase();
+        } catch {
+          continue;
+        }
+        if (provider === "pocketbase") {
+          configProvider.invalidatePocketBaseToken?.();
+        } else if (provider === "actual") {
+          try {
+            configProvider.invalidateActualConfig?.();
+            if (onActualRefreshed) {
+              await onActualRefreshed();
+            }
+          } catch (err) {
+            console.error(`[Actual MCP] Failed to refresh Actual config on api.token.refreshed: ${err.message}`);
           }
-        } catch (err) {
-          console.error(`[Actual MCP] Failed to refresh Actual config on api.actual.refreshed: ${err.message}`);
         }
       }
     })().catch(() => {});
