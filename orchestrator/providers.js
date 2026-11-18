@@ -18,15 +18,15 @@ export class GatewayActualConfigProvider {
   }
 
   async getActualConfig() {
-    const resp = await fetch(`${this.gatewayUrl}/api/actual/token`, {
+    const resp = await fetch(`${this.gatewayUrl}/api/secrets/actual`, {
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
-      throw new Error(`Failed to fetch Actual config from ${this.gatewayUrl}/api/actual/token (HTTP ${resp.status})`);
+      throw new Error(`Failed to fetch Actual config from ${this.gatewayUrl}/api/secrets/actual (HTTP ${resp.status})`);
     }
     const data = await resp.json();
     if (!data.server_url || !data.sync_id) {
-      throw new Error(`Incomplete Actual config returned by ${this.gatewayUrl}/api/actual/token`);
+      throw new Error(`Incomplete Actual config returned by ${this.gatewayUrl}/api/secrets/actual`);
     }
     return {
       serverUrl: data.server_url,
@@ -48,7 +48,7 @@ export class GatewayActualConfigProvider {
       };
     }
 
-    const resp = await fetch(`${this.gatewayUrl}/api/pocketbase/token?role=actual_orch`, {
+    const resp = await fetch(`${this.gatewayUrl}/api/secrets/pocketbase?role=actual_orch`, {
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
@@ -73,7 +73,7 @@ export class GatewayActualConfigProvider {
         apiToken: this.pbApiToken,
       };
     }
-    throw new Error("PocketBase token missing in gateway-mcp /api/pocketbase/token response");
+    throw new Error("PocketBase token missing in gateway-mcp /api/secrets/pocketbase response");
   }
 
   invalidatePocketBaseToken() {

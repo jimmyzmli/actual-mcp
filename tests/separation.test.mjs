@@ -27,8 +27,8 @@ test("mcp_server and pocketbase.js have no NATS or gateway-mcp coupling", () => 
   const mcpSrv = fs.readFileSync(path.join(ROOT_DIR, "mcp_server", "server.js"), "utf-8");
   const pbJs = fs.readFileSync(path.join(ROOT_DIR, "pocketbase.js"), "utf-8");
   assert.equal(mcpSrv.includes('from "nats"'), false);
-  assert.equal(mcpSrv.includes("/api/actual/token"), false);
-  assert.equal(pbJs.includes("/api/pocketbase/token"), false);
+  assert.equal(mcpSrv.includes("/api/secrets/actual"), false);
+  assert.equal(pbJs.includes("/api/secrets/pocketbase"), false);
   assert.equal(pbJs.includes("startRealtimeListener"), false);
 });
 
