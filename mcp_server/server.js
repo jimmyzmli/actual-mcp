@@ -4039,7 +4039,7 @@ async function handleExecuteTool(name, toolInput, explicitClientId = null) {
 // ───────────────────────────────────────────────────────────
 function createServer() {
   const server = new Server({
-    name: "actual-cli-mcp",
+    name: "actual-mcp",
     version: "2.0.0"
   }, {
     capabilities: {
