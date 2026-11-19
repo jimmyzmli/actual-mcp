@@ -1,9 +1,28 @@
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { connect as connectNats } from "nats";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadAppConfig() {
+  try {
+    const cfgPath = path.resolve(__dirname, "..", "config", "app.json");
+    if (fs.existsSync(cfgPath)) {
+      return JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
 export async function startNatsTokenSubscriber(configProvider, { onActualRefreshed = null, natsUrl = null } = {}) {
+  const appCfg = loadAppConfig();
   const url =
     natsUrl ||
+    appCfg.nats_url ||
     process.env.NATS_URL ||
     (os.platform() === "darwin" ? "nats://pc.lzn.ca:4222" : "nats://127.0.0.1:4222");
 
