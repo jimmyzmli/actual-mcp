@@ -43,6 +43,7 @@ export class GatewayActualConfigProvider {
 
   async getActualConfig() {
     const resp = await fetch(`${this.gatewayUrl}/api/secrets/actual`, {
+      headers: { "X-Client-Info": "service:actual-mcp" },
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
@@ -73,6 +74,7 @@ export class GatewayActualConfigProvider {
     }
 
     const resp = await fetch(`${this.gatewayUrl}/api/secrets/pocketbase?role=actual_orch`, {
+      headers: { "X-Client-Info": "service:actual-mcp" },
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
