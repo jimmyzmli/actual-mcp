@@ -1,6 +1,21 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadAppConfig() {
+  try {
+    const cfgPath = path.resolve(__dirname, "..", "config", "app.json");
+    if (fs.existsSync(cfgPath)) {
+      return JSON.parse(fs.readFileSync(cfgPath, "utf-8")) || {};
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
 
 /**
  * Default .env / local file ConfigProvider for standalone pure-MCP mode.
@@ -38,7 +53,13 @@ export class DefaultActualConfigProvider {
   invalidateActualConfig() {}
 
   async getPocketBaseAuth() {
-    const baseUrl = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || "https://pb.lzn.ca").replace(/\/+$/, "");
+    const appCfg = loadAppConfig();
+    const baseUrl = (
+      process.env.PB_UPLOAD_BASE_URL ||
+      process.env.PB_BASE_URL ||
+      appCfg.pocketbase_url ||
+      "https://pb.lzn.ca"
+    ).replace(/\/+$/, "");
     const apiToken = process.env.PB_API_TOKEN || null;
     const token = process.env.PB_TOKEN || apiToken || null;
     if (!token) {

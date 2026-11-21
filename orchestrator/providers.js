@@ -1,4 +1,21 @@
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadAppConfig() {
+  try {
+    const cfgPath = path.resolve(__dirname, "..", "config", "app.json");
+    if (fs.existsSync(cfgPath)) {
+      return JSON.parse(fs.readFileSync(cfgPath, "utf-8")) || {};
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
 
 /**
  * Gateway-backed ConfigProvider injected when actual-mcp runs wrapped.
@@ -6,14 +23,21 @@ import os from "node:os";
  */
 export class GatewayActualConfigProvider {
   constructor(gatewayUrl = null) {
+    const appCfg = loadAppConfig();
     this.gatewayUrl = (
       gatewayUrl ||
+      appCfg.gateway_url ||
       process.env.GATEWAY_URL ||
       (os.platform() === "darwin" ? "http://pc.lzn.ca:9999" : "http://127.0.0.1:9999")
     ).replace(/\/+$/, "");
     this.cachedPbToken = null;
     this.pbTokenExpiry = 0;
-    this.pbBaseUrl = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || "https://pb.lzn.ca").replace(/\/+$/, "");
+    this.pbBaseUrl = (
+      process.env.PB_UPLOAD_BASE_URL ||
+      process.env.PB_BASE_URL ||
+      appCfg.pocketbase_url ||
+      "https://pb.lzn.ca"
+    ).replace(/\/+$/, "");
     this.pbApiToken = process.env.PB_API_TOKEN || null;
   }
 

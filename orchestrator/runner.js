@@ -71,12 +71,14 @@ export function startPocketBaseRealtimeSync(toolCaller, configProvider) {
   const abortController = new AbortController();
   const { signal } = abortController;
   let reconnectTimer = null;
+  const appCfg = loadAppConfig();
+  const reconnectDelayMs = Math.max(500, Number(appCfg.realtime_reconnect_delay_ms) || 5000);
 
   const connect = async () => {
     if (signal.aborted) return;
     try {
       const auth = await configProvider.getPocketBaseAuth();
-      const baseUrl = String(auth.baseUrl || "https://pb.lzn.ca").replace(/\/+$/, "");
+      const baseUrl = String(auth.baseUrl || appCfg.pocketbase_url || "https://pb.lzn.ca").replace(/\/+$/, "");
       const headers = {};
       if (auth.token) {
         if (auth.apiToken && auth.token === auth.apiToken) {
@@ -146,8 +148,8 @@ export function startPocketBaseRealtimeSync(toolCaller, configProvider) {
       }
     } catch (err) {
       if (!signal.aborted) {
-        console.error(`[PocketBase Realtime] Stream disconnected (${err.message}), reconnecting in 5s...`);
-        reconnectTimer = setTimeout(connect, 5000);
+        console.error(`[PocketBase Realtime] Stream disconnected (${err.message}), reconnecting in ${reconnectDelayMs}ms...`);
+        reconnectTimer = setTimeout(connect, reconnectDelayMs);
       }
     }
   };
@@ -159,7 +161,12 @@ export function startPocketBaseRealtimeSync(toolCaller, configProvider) {
   };
 }
 
-export function startPeriodicReceiptSync(toolCaller, intervalMs = 15 * 60 * 1000) {
+export function startPeriodicReceiptSync(toolCaller, intervalMs = null) {
+  const appCfg = loadAppConfig();
+  const cfgMs = Number(appCfg.receipt_sync_interval_seconds) > 0
+    ? Number(appCfg.receipt_sync_interval_seconds) * 1000
+    : 15 * 60 * 1000;
+  const resolvedIntervalMs = intervalMs ?? Math.max(30_000, cfgMs);
   // Initial backfill check if local SQLite cache is empty or unmigrated
   toolCaller.call("actual_sync_receipts", { initial_if_empty: true }).catch((err) => {
     console.error(`[PocketBase] Initial receipt sync check error: ${err.message}`);
@@ -169,7 +176,7 @@ export function startPeriodicReceiptSync(toolCaller, intervalMs = 15 * 60 * 1000
     toolCaller.call("actual_sync_receipts", {}).catch((err) => {
       console.error(`[PocketBase Background Sync] Error: ${err.message}`);
     });
-  }, intervalMs);
+  }, resolvedIntervalMs);
   timer.unref?.();
   return () => clearInterval(timer);
 }

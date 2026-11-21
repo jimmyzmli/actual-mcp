@@ -7,7 +7,18 @@ import { getConfigProvider } from "./mcp_server/providers.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-let PB_BASE_URL = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || "https://pb.lzn.ca").replace(/\/+$/, "");
+function _loadAppPocketBaseUrl() {
+  try {
+    const cfgPath = path.join(__dirname, "config", "app.json");
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8")) || {};
+      if (cfg.pocketbase_url) return String(cfg.pocketbase_url);
+    }
+  } catch {}
+  return null;
+}
+
+let PB_BASE_URL = (process.env.PB_UPLOAD_BASE_URL || process.env.PB_BASE_URL || _loadAppPocketBaseUrl() || "https://pb.lzn.ca").replace(/\/+$/, "");
 let PB_API_TOKEN = process.env.PB_API_TOKEN || null;
 
 // ─── Local SQLite Database Setup ───
