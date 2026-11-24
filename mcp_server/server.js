@@ -4208,8 +4208,8 @@ export async function startServer({ failFastConfig = false } = {}) {
       methods: ['GET', 'POST', 'DELETE'],
       allowedHeaders: ['Content-Type', 'Accept', 'Mcp-Session-Id'],
     }));
-    app.use(express.json({ limit: '1mb' }));
-    app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+    app.use(express.json({ limit: '50mb' }));
+    app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
     // Per-session transport map — supports multiple concurrent clients
     const transports = new Map();
